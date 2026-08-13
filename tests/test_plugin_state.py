@@ -8,7 +8,7 @@ import importlib.util
 import sys
 import types
 import uuid
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import TestCase, main, mock
 
 
@@ -190,6 +190,21 @@ class PluginStateTests(TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(state["save_calls"], 0)
 
+    def test_config_path_requires_exact_home_and_file_case(self) -> None:
+        """Reject case-only changes in the expected configuration path."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        exact = home / "config.yaml"
+        case_home = self.fixture / "HOME" / "config.yaml"
+        case_file = home / "CONFIG.yaml"
+
+        self.assertEqual(script._validate_config_path(home, exact), exact.absolute())
+        with self.assertRaisesRegex(SystemExit, "unexpected configuration path"):
+            script._validate_config_path(home, case_home)
+        with self.assertRaisesRegex(SystemExit, "unexpected configuration path"):
+            script._validate_config_path(home, case_file)
+
     def test_receipt_path_rejects_outside_sibling_and_source_paths(self) -> None:
         """Reject receipt paths outside the safe profile home."""
 
@@ -197,6 +212,8 @@ class PluginStateTests(TestCase):
         home = self.fixture / "home"
         outside = self.fixture.parent / f"outside-{uuid.uuid4().hex}.json"
         sibling = self.fixture / "home-other" / "transaction.json"
+        case_sibling = self.fixture / "HOME" / "transaction.json"
+        descendant = home / "backup" / "transaction.json"
         source = home / "source" / "transaction.json"
         (source.parent / "hermes_cli").mkdir(parents=True)
         (source.parent / "hermes_cli" / "config.py").write_text("", encoding="utf-8")
@@ -207,8 +224,55 @@ class PluginStateTests(TestCase):
             script._validate_receipt_path(home, outside)
         with self.assertRaisesRegex(SystemExit, "outside"):
             script._validate_receipt_path(home, sibling)
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, case_sibling)
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, home)
+        self.assertEqual(
+            script._validate_receipt_path(home, descendant),
+            script._absolute_lexical_path(descendant),
+        )
         with self.assertRaisesRegex(SystemExit, "source directory"):
             script._validate_receipt_path(home, source)
+
+    def test_lexical_descendant_uses_exact_windows_path_components(self) -> None:
+        """Handle Windows drives, roots, and UNC paths without case folding."""
+
+        script = load_script()
+        is_descendant = script._is_strict_lexical_descendant
+        accepted = (
+            (r"C:\Data\Hermes", r"C:\Data\Hermes\backup\transaction.json"),
+            ("C:\\", r"C:\backup\transaction.json"),
+            (
+                r"\\server\share\Hermes",
+                r"\\server\share\Hermes\backup\transaction.json",
+            ),
+            ("\\\\server\\share\\", r"\\server\share\transaction.json"),
+        )
+        rejected = (
+            (r"C:\Data\Hermes", r"C:\Data\hermes\backup\transaction.json"),
+            (r"C:\Data\Hermes", r"c:\Data\Hermes\backup\transaction.json"),
+            (r"C:\Data\Hermes", r"C:\Data\Hermes-other\transaction.json"),
+            (r"C:\Data\Hermes", r"D:\Data\Hermes\transaction.json"),
+            (r"C:\Data\Hermes", r"C:\Data\Hermes"),
+            (
+                r"\\server\share\Hermes",
+                r"\\SERVER\share\Hermes\transaction.json",
+            ),
+            (
+                r"\\server\share\Hermes",
+                r"\\server\other\Hermes\transaction.json",
+            ),
+        )
+
+        for home, receipt in accepted:
+            self.assertTrue(
+                is_descendant(PureWindowsPath(home), PureWindowsPath(receipt))
+            )
+        for home, receipt in rejected:
+            self.assertFalse(
+                is_descendant(PureWindowsPath(home), PureWindowsPath(receipt))
+            )
 
     def test_receipt_path_rejects_a_redirected_ancestor(self) -> None:
         """Reject a receipt path with a redirected existing ancestor."""

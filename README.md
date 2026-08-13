@@ -204,7 +204,7 @@ See [SECURITY.md](SECURITY.md) for the full write boundary, rollback behavior, n
 
 Version 1.0.1 was verified with a current Hermes Agent 0.20.0 build on Windows:
 
-- 82 focused Python tests passed. Three expected platform-specific tests were skipped on Windows and run in Ubuntu CI.
+- 84 focused Python tests passed. Three expected platform-specific tests were skipped on Windows and run in Ubuntu CI.
 - Python compile, Desktop plugin syntax, and Windows PowerShell 5.1 parser checks passed.
 - Install and removal scripts rejected Hermes source-tree targets.
 - The installed backend returned all eight standard roles and only configured provider catalog entries.

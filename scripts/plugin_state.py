@@ -161,7 +161,7 @@ def _validate_config_path(home: Path, path: Path) -> Path:
 
     config_path = _absolute_lexical_path(path)
     expected = _absolute_lexical_path(home / "config.yaml")
-    if os.path.normcase(os.fspath(config_path)) != os.path.normcase(os.fspath(expected)):
+    if not _same_lexical_path(config_path, expected):
         raise SystemExit("Hermes returned an unexpected configuration path.")
     _reject_reparse_ancestors(config_path)
     if _find_hermes_source_root(config_path.parent) is not None:
@@ -169,15 +169,29 @@ def _validate_config_path(home: Path, path: Path) -> Path:
     return config_path
 
 
+def _same_lexical_path(first: Path, second: Path) -> bool:
+    """Return true when two paths have the same exact components."""
+
+    return first.parts == second.parts
+
+
+def _is_strict_lexical_descendant(home: Path, candidate: Path) -> bool:
+    """Return true when exact path components put a candidate below a home."""
+
+    home_parts = home.parts
+    candidate_parts = candidate.parts
+    return (
+        len(candidate_parts) > len(home_parts)
+        and candidate_parts[: len(home_parts)] == home_parts
+    )
+
+
 def _validate_receipt_path(home: Path, path: Path) -> Path:
     """Return one receipt path inside the safe Hermes profile home."""
 
     receipt_path = _absolute_lexical_path(path)
     home_path = _absolute_lexical_path(home)
-    home_prefix = os.fspath(home_path) + os.sep
-    if not os.path.normcase(os.fspath(receipt_path)).startswith(
-        os.path.normcase(home_prefix)
-    ):
+    if not _is_strict_lexical_descendant(home_path, receipt_path):
         raise SystemExit("The transaction receipt is outside the Hermes profile home.")
     _reject_reparse_ancestors(receipt_path)
     if _find_hermes_source_root(receipt_path.parent) is not None:
