@@ -133,7 +133,7 @@ def config_revision(path: Path) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
-def _copy_windows_security_descriptor(source: Path, destination: Path) -> None:
+def _copy_windows_security_descriptor(source: Path, destination: Path) -> Callable[[], None]:
     """Copy the source owner and DACL state to the replacement."""
 
     import ctypes
@@ -145,12 +145,13 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> None:
     protected_dacl_security_information = 0x80000000
     se_dacl_protected = 0x1000
     error_insufficient_buffer = 122
-    required = wintypes.DWORD()
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     get_file_security = advapi32.GetFileSecurityW
     set_file_security = advapi32.SetFileSecurityW
     get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
     get_security_descriptor_owner = advapi32.GetSecurityDescriptorOwner
+    get_security_descriptor_dacl = advapi32.GetSecurityDescriptorDacl
+    get_acl_information = advapi32.GetAclInformation
     equal_sid = advapi32.EqualSid
     get_file_security.argtypes = [
         wintypes.LPCWSTR,
@@ -178,6 +179,20 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> None:
         ctypes.POINTER(wintypes.BOOL),
     ]
     get_security_descriptor_owner.restype = wintypes.BOOL
+    get_security_descriptor_dacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_security_descriptor_dacl.restype = wintypes.BOOL
+    get_acl_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    get_acl_information.restype = wintypes.BOOL
     equal_sid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     equal_sid.restype = wintypes.BOOL
 
@@ -221,20 +236,67 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> None:
             raise OSError(error, "Cannot read the configuration owner.", str(path))
         return owner
 
+    class AclSizeInformation(ctypes.Structure):
+        """Describe the byte size of one Windows access control list."""
+
+        _fields_ = [
+            ("AceCount", wintypes.DWORD),
+            ("AclBytesInUse", wintypes.DWORD),
+            ("AclBytesFree", wintypes.DWORD),
+        ]
+
+    def dacl_state(descriptor, path: Path) -> tuple[bool, bool, bytes]:
+        """Return the DACL presence, nullness, and used bytes."""
+
+        present = wintypes.BOOL()
+        dacl = ctypes.c_void_p()
+        defaulted = wintypes.BOOL()
+        if not get_security_descriptor_dacl(
+            descriptor,
+            ctypes.byref(present),
+            ctypes.byref(dacl),
+            ctypes.byref(defaulted),
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, "Cannot read the configuration DACL.", str(path))
+        if not present.value:
+            return False, False, b""
+        if not dacl.value:
+            return True, True, b""
+        information = AclSizeInformation()
+        acl_size_information = 2
+        if not get_acl_information(
+            dacl,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+            acl_size_information,
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, "Cannot read the configuration DACL size.", str(path))
+        return True, False, ctypes.string_at(dacl, information.AclBytesInUse)
+
+    def dacl_protected(descriptor, path: Path) -> bool:
+        """Return the DACL protection state from a security descriptor."""
+
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not get_security_descriptor_control(
+            descriptor,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, "Cannot read the configuration DACL control state.", str(path))
+        return bool(control.value & se_dacl_protected)
+
     security_information = owner_security_information | dacl_security_information
     descriptor = read_security_descriptor(source)
-    control = wintypes.WORD()
-    revision = wintypes.DWORD()
-    if not get_security_descriptor_control(
-        descriptor,
-        ctypes.byref(control),
-        ctypes.byref(revision),
-    ):
-        error = ctypes.get_last_error()
-        raise OSError(error, "Cannot read the configuration DACL control state.", str(source))
+    source_owner = owner_sid(descriptor, source)
+    source_protected = dacl_protected(descriptor, source)
+    source_dacl = dacl_state(descriptor, source)
     dacl_control = (
         protected_dacl_security_information
-        if control.value & se_dacl_protected
+        if source_protected
         else unprotected_dacl_security_information
     )
     if not set_file_security(
@@ -245,11 +307,30 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> None:
         error = ctypes.get_last_error()
         raise OSError(error, "Cannot set the replacement security descriptor.", str(destination))
     replacement_descriptor = read_security_descriptor(destination)
-    if not equal_sid(owner_sid(descriptor, source), owner_sid(replacement_descriptor, destination)):
+    if not equal_sid(source_owner, owner_sid(replacement_descriptor, destination)):
         raise OSError("The replacement configuration owner does not match the source.")
+    if source_protected != dacl_protected(replacement_descriptor, destination):
+        raise OSError("The replacement configuration DACL protection does not match the source.")
+    if source_dacl != dacl_state(replacement_descriptor, destination):
+        raise OSError("The replacement configuration DACL does not match the source.")
+
+    def verify_source_unchanged() -> None:
+        """Reject a source security change before the replacement."""
+
+        current_descriptor = read_security_descriptor(source)
+        # Keep descriptor alive here. Its owner SID pointer remains valid only
+        # while the ctypes descriptor buffer exists.
+        if not equal_sid(owner_sid(descriptor, source), owner_sid(current_descriptor, source)):
+            raise OSError("The configuration owner changed during the write.")
+        if source_protected != dacl_protected(current_descriptor, source):
+            raise OSError("The configuration DACL protection changed during the write.")
+        if source_dacl != dacl_state(current_descriptor, source):
+            raise OSError("The configuration DACL changed during the write.")
+
+    return verify_source_unchanged
 
 
-def _copy_security_metadata(source: Path, destination: Path) -> None:
+def _copy_security_metadata(source: Path, destination: Path) -> Callable[[], None] | None:
     """Copy access metadata before the replacement becomes the configuration."""
 
     try:
@@ -257,11 +338,12 @@ def _copy_security_metadata(source: Path, destination: Path) -> None:
         # system POSIX ACL. Windows needs the security descriptor copied separately.
         shutil.copystat(source, destination, follow_symlinks=False)
         if os.name == "nt":
-            _copy_windows_security_descriptor(source, destination)
+            return _copy_windows_security_descriptor(source, destination)
     except OSError as exc:
         raise ConfigWriteUnavailable(
             "The configuration security metadata cannot be copied."
         ) from exc
+    return None
 
 
 def conditional_roundtrip_yaml_update(
@@ -365,8 +447,9 @@ def conditional_roundtrip_yaml_update(
             yaml.dump(config, handle)
             handle.flush()
             os.fsync(handle.fileno())
+        security_verifier: Callable[[], None] | None = None
         if not source_missing:
-            _copy_security_metadata(target, temporary)
+            security_verifier = _copy_security_metadata(target, temporary)
         candidate_revision = config_revision(temporary)
         if before_replace is not None:
             before_replace(candidate_revision)
@@ -381,6 +464,13 @@ def conditional_roundtrip_yaml_update(
             raise ConfigConflict("The configuration path changed during the write.")
         if config_revision(target) != expected_revision:
             raise ConfigConflict("The configuration changed during the write.")
+        if security_verifier is not None:
+            try:
+                security_verifier()
+            except OSError as exc:
+                raise ConfigWriteUnavailable(
+                    "The configuration security metadata changed during the write."
+                ) from exc
         try:
             os.replace(temporary, target)
         except OSError as exc:

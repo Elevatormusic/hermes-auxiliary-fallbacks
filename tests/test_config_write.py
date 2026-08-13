@@ -154,17 +154,19 @@ def windows_owner_sid(path: Path) -> bytes:
     return ctypes.string_at(owner, size)
 
 
-def set_windows_dacl_protected(path: Path) -> None:
-    """Set protected DACL inheritance for one temporary test file."""
+def set_windows_dacl_protection(path: Path, protected: bool) -> None:
+    """Set the requested DACL inheritance state for one temporary test file."""
 
     dacl_security_information = 0x00000004
+    unprotected_dacl_security_information = 0x20000000
     protected_dacl_security_information = 0x80000000
     se_dacl_protected = 0x1000
     advapi32, descriptor = windows_security_descriptor(path)
+    control_bits = se_dacl_protected if protected else 0
     if not advapi32.SetSecurityDescriptorControl(
         descriptor,
         se_dacl_protected,
-        se_dacl_protected,
+        control_bits,
     ):
         import ctypes
 
@@ -172,13 +174,24 @@ def set_windows_dacl_protected(path: Path) -> None:
         raise OSError(error, "Cannot set the test DACL control state.", str(path))
     if not advapi32.SetFileSecurityW(
         str(path),
-        dacl_security_information | protected_dacl_security_information,
+        dacl_security_information
+        | (
+            protected_dacl_security_information
+            if protected
+            else unprotected_dacl_security_information
+        ),
         descriptor,
     ):
         import ctypes
 
         error = ctypes.get_last_error()
         raise OSError(error, "Cannot set the test DACL control state.", str(path))
+
+
+def set_windows_dacl_protected(path: Path) -> None:
+    """Set protected DACL inheritance for one temporary test file."""
+
+    set_windows_dacl_protection(path, True)
 
 
 def test_conditional_update_preserves_comments_and_unrelated_values(tmp_path):
@@ -295,6 +308,39 @@ def test_conditional_update_fails_closed_when_owner_copy_fails(tmp_path, monkeyp
     assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
 
 
+@pytest.mark.parametrize("mismatch", ["DACL", "DACL protection"])
+def test_conditional_update_rejects_security_verification_mismatch(
+    tmp_path,
+    monkeypatch,
+    mismatch,
+):
+    """Reject a temporary security state that does not match the source."""
+
+    writer = load_writer()
+    config_path = tmp_path / "config.yaml"
+    original = "theme: gold\n"
+    config_path.write_text(original, encoding="utf-8")
+
+    def copy_security_metadata(*_args, **_kwargs):
+        def verify() -> None:
+            raise OSError(f"{mismatch} mismatch")
+
+        return verify
+
+    monkeypatch.setattr(writer, "_copy_security_metadata", copy_security_metadata)
+    with pytest.raises(writer.ConfigWriteUnavailable, match="security metadata changed") as caught:
+        writer.conditional_roundtrip_yaml_update(
+            config_path,
+            "auxiliary.vision.fallback_chain",
+            [],
+            writer.config_revision(config_path),
+        )
+
+    assert mismatch not in str(caught.value)
+    assert config_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
+
+
 def test_conditional_update_preserves_posix_extended_metadata(tmp_path):
     if os.name != "posix" or not hasattr(os, "setxattr"):
         pytest.skip("POSIX extended attributes are not available.")
@@ -343,6 +389,76 @@ def test_conditional_update_preserves_windows_dacl_protection(tmp_path):
     assert after_protected is True
     assert after_dacl == before_dacl
     assert after_owner == before_owner
+
+
+def test_conditional_update_handles_windows_unprotected_dacl(tmp_path):
+    """Preserve an unprotected DACL or fail before replacement."""
+
+    if os.name != "nt":
+        pytest.skip("Windows DACL protection is not available.")
+    writer = load_writer()
+    config_path = tmp_path / "config.yaml"
+    original = "theme: gold\n"
+    config_path.write_text(original, encoding="utf-8")
+    try:
+        set_windows_dacl_protection(config_path, False)
+    except OSError:
+        pytest.skip("The test user cannot set an unprotected DACL.")
+    before_protected, before_dacl = windows_dacl_state(config_path)
+    before_owner = windows_owner_sid(config_path)
+    assert before_protected is False
+
+    try:
+        writer.conditional_roundtrip_yaml_update(
+            config_path,
+            "auxiliary.vision.fallback_chain",
+            [],
+            writer.config_revision(config_path),
+        )
+    except writer.ConfigWriteUnavailable as exc:
+        assert "security metadata" in str(exc)
+        assert config_path.read_text(encoding="utf-8") == original
+        assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
+        return
+
+    after_protected, after_dacl = windows_dacl_state(config_path)
+    after_owner = windows_owner_sid(config_path)
+    assert after_protected is False
+    assert after_dacl == before_dacl
+    assert after_owner == before_owner
+
+
+def test_conditional_update_rejects_windows_source_dacl_drift(tmp_path):
+    """Reject source DACL changes that occur after temporary-file preparation."""
+
+    if os.name != "nt":
+        pytest.skip("Windows DACL protection is not available.")
+    writer = load_writer()
+    config_path = tmp_path / "config.yaml"
+    original = "theme: gold\n"
+    config_path.write_text(original, encoding="utf-8")
+    try:
+        set_windows_dacl_protected(config_path)
+    except OSError:
+        pytest.skip("The test user cannot set a protected DACL.")
+
+    try:
+        with pytest.raises(writer.ConfigWriteUnavailable, match="security metadata changed"):
+            writer.conditional_roundtrip_yaml_update(
+                config_path,
+                "auxiliary.vision.fallback_chain",
+                [],
+                writer.config_revision(config_path),
+                before_replace=lambda _revision: set_windows_dacl_protection(
+                    config_path,
+                    False,
+                ),
+            )
+    finally:
+        set_windows_dacl_protected(config_path)
+
+    assert config_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
 
 
 def test_conditional_update_rejects_external_change_before_replace(tmp_path):

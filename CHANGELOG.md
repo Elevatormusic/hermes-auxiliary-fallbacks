@@ -9,7 +9,7 @@ All notable changes to this project are listed in this file.
 - Keep unrelated settings when a concurrent write can be detected.
 - Add fixed error messages that do not expose configuration values.
 - Reject redirected profile and configuration paths at request and write time.
-- Preserve configuration security metadata, owner identity, DACL entries, and DACL protection state during replacement.
+- Preserve and verify configuration security metadata, owner identity, protected and unprotected DACL entries, DACL protection state, and source security state during replacement.
 - Keep profile target paths lexical so safety checks can detect redirects.
 - Read smoke-test provider settings from the active Hermes profile.
 - Validate direct helper homes and configuration paths before an override or write.
