@@ -33,37 +33,39 @@ def load_writer():
     return module
 
 
-def windows_dacl_descriptor(path: Path):
-    """Return the Windows DACL descriptor for one temporary test file."""
+def windows_security_descriptor(path: Path):
+    """Return the Windows owner and DACL descriptor for one temporary test file."""
 
     import ctypes
     from ctypes import wintypes
 
+    owner_security_information = 0x00000001
     dacl_security_information = 0x00000004
+    security_information = owner_security_information | dacl_security_information
     error_insufficient_buffer = 122
     required = wintypes.DWORD()
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     get_file_security = advapi32.GetFileSecurityW
     if not get_file_security(
         str(path),
-        dacl_security_information,
+        security_information,
         None,
         0,
         ctypes.byref(required),
     ):
         error = ctypes.get_last_error()
         if error != error_insufficient_buffer or required.value == 0:
-            raise OSError(error, "Cannot read the test DACL.", str(path))
+            raise OSError(error, "Cannot read the test security descriptor.", str(path))
     descriptor = ctypes.create_string_buffer(required.value)
     if not get_file_security(
         str(path),
-        dacl_security_information,
+        security_information,
         descriptor,
         required.value,
         ctypes.byref(required),
     ):
         error = ctypes.get_last_error()
-        raise OSError(error, "Cannot read the test DACL.", str(path))
+        raise OSError(error, "Cannot read the test security descriptor.", str(path))
     return advapi32, descriptor
 
 
@@ -80,7 +82,7 @@ def windows_dacl_state(path: Path) -> tuple[bool, bytes]:
     from ctypes import wintypes
 
     se_dacl_protected = 0x1000
-    advapi32, descriptor = windows_dacl_descriptor(path)
+    advapi32, descriptor = windows_security_descriptor(path)
     control = wintypes.WORD()
     revision = wintypes.DWORD()
     if not advapi32.GetSecurityDescriptorControl(
@@ -129,13 +131,36 @@ def windows_dacl_state(path: Path) -> tuple[bool, bytes]:
     )
 
 
+def windows_owner_sid(path: Path) -> bytes:
+    """Return the owner SID bytes for one temporary test file."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32, descriptor = windows_security_descriptor(path)
+    owner = ctypes.c_void_p()
+    defaulted = wintypes.BOOL()
+    if not advapi32.GetSecurityDescriptorOwner(
+        descriptor,
+        ctypes.byref(owner),
+        ctypes.byref(defaulted),
+    ) or not owner.value:
+        error = ctypes.get_last_error()
+        raise OSError(error, "Cannot read the test owner SID.", str(path))
+    size = advapi32.GetLengthSid(owner)
+    if size == 0:
+        error = ctypes.get_last_error()
+        raise OSError(error, "Cannot read the test owner SID size.", str(path))
+    return ctypes.string_at(owner, size)
+
+
 def set_windows_dacl_protected(path: Path) -> None:
     """Set protected DACL inheritance for one temporary test file."""
 
     dacl_security_information = 0x00000004
     protected_dacl_security_information = 0x80000000
     se_dacl_protected = 0x1000
-    advapi32, descriptor = windows_dacl_descriptor(path)
+    advapi32, descriptor = windows_security_descriptor(path)
     if not advapi32.SetSecurityDescriptorControl(
         descriptor,
         se_dacl_protected,
@@ -239,6 +264,29 @@ def test_conditional_update_fails_closed_when_metadata_copy_fails(tmp_path, monk
     assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
 
 
+def test_conditional_update_fails_closed_when_owner_copy_fails(tmp_path, monkeypatch):
+    writer = load_writer()
+    config_path = tmp_path / "config.yaml"
+    original = "theme: gold\n"
+    config_path.write_text(original, encoding="utf-8")
+
+    def fail_owner_copy(*_args, **_kwargs) -> None:
+        raise OSError("access denied")
+
+    monkeypatch.setattr(writer, "_copy_windows_security_descriptor", fail_owner_copy)
+    monkeypatch.setattr(writer.os, "name", "nt")
+    with pytest.raises(writer.ConfigWriteUnavailable, match="security metadata"):
+        writer.conditional_roundtrip_yaml_update(
+            config_path,
+            "auxiliary.vision.fallback_chain",
+            [],
+            writer.config_revision(config_path),
+        )
+
+    assert config_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
+
+
 def test_conditional_update_preserves_posix_extended_metadata(tmp_path):
     if os.name != "posix" or not hasattr(os, "setxattr"):
         pytest.skip("POSIX extended attributes are not available.")
@@ -272,6 +320,7 @@ def test_conditional_update_preserves_windows_dacl_protection(tmp_path):
     except OSError:
         pytest.skip("The test user cannot set a protected DACL.")
     before_protected, before_dacl = windows_dacl_state(config_path)
+    before_owner = windows_owner_sid(config_path)
     assert before_protected is True
 
     writer.conditional_roundtrip_yaml_update(
@@ -282,8 +331,10 @@ def test_conditional_update_preserves_windows_dacl_protection(tmp_path):
     )
 
     after_protected, after_dacl = windows_dacl_state(config_path)
+    after_owner = windows_owner_sid(config_path)
     assert after_protected is True
     assert after_dacl == before_dacl
+    assert after_owner == before_owner
 
 
 def test_conditional_update_rejects_external_change_before_replace(tmp_path):

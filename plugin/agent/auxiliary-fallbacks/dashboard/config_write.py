@@ -133,12 +133,13 @@ def config_revision(path: Path) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
-def _copy_windows_dacl(source: Path, destination: Path) -> None:
-    """Copy the source discretionary access control list to the replacement."""
+def _copy_windows_security_descriptor(source: Path, destination: Path) -> None:
+    """Copy the source owner and DACL state to the replacement."""
 
     import ctypes
     from ctypes import wintypes
 
+    owner_security_information = 0x00000001
     dacl_security_information = 0x00000004
     unprotected_dacl_security_information = 0x20000000
     protected_dacl_security_information = 0x80000000
@@ -149,14 +150,79 @@ def _copy_windows_dacl(source: Path, destination: Path) -> None:
     get_file_security = advapi32.GetFileSecurityW
     set_file_security = advapi32.SetFileSecurityW
     get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
-    if not get_file_security(str(source), dacl_security_information, None, 0, ctypes.byref(required)):
-        error = ctypes.get_last_error()
-        if error != error_insufficient_buffer or required.value == 0:
-            raise OSError(error, "Cannot read the configuration DACL.", str(source))
-    descriptor = ctypes.create_string_buffer(required.value)
-    if not get_file_security(str(source), dacl_security_information, descriptor, required.value, ctypes.byref(required)):
-        error = ctypes.get_last_error()
-        raise OSError(error, "Cannot read the configuration DACL.", str(source))
+    get_security_descriptor_owner = advapi32.GetSecurityDescriptorOwner
+    equal_sid = advapi32.EqualSid
+    get_file_security.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_file_security.restype = wintypes.BOOL
+    set_file_security.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    set_file_security.restype = wintypes.BOOL
+    get_security_descriptor_control.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_security_descriptor_control.restype = wintypes.BOOL
+    get_security_descriptor_owner.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    get_security_descriptor_owner.restype = wintypes.BOOL
+    equal_sid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    equal_sid.restype = wintypes.BOOL
+
+    def read_security_descriptor(path: Path):
+        """Read the required source or temporary security descriptor."""
+
+        size = wintypes.DWORD()
+        if not get_file_security(
+            str(path),
+            security_information,
+            None,
+            0,
+            ctypes.byref(size),
+        ):
+            error = ctypes.get_last_error()
+            if error != error_insufficient_buffer or size.value == 0:
+                raise OSError(error, "Cannot read the configuration security descriptor.", str(path))
+        value = ctypes.create_string_buffer(size.value)
+        if not get_file_security(
+            str(path),
+            security_information,
+            value,
+            size.value,
+            ctypes.byref(size),
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(error, "Cannot read the configuration security descriptor.", str(path))
+        return value
+
+    def owner_sid(descriptor, path: Path) -> ctypes.c_void_p:
+        """Read one non-null owner SID from a security descriptor."""
+
+        owner = ctypes.c_void_p()
+        defaulted = wintypes.BOOL()
+        if not get_security_descriptor_owner(
+            descriptor,
+            ctypes.byref(owner),
+            ctypes.byref(defaulted),
+        ) or not owner.value:
+            error = ctypes.get_last_error()
+            raise OSError(error, "Cannot read the configuration owner.", str(path))
+        return owner
+
+    security_information = owner_security_information | dacl_security_information
+    descriptor = read_security_descriptor(source)
     control = wintypes.WORD()
     revision = wintypes.DWORD()
     if not get_security_descriptor_control(
@@ -173,11 +239,14 @@ def _copy_windows_dacl(source: Path, destination: Path) -> None:
     )
     if not set_file_security(
         str(destination),
-        dacl_security_information | dacl_control,
+        security_information | dacl_control,
         descriptor,
     ):
         error = ctypes.get_last_error()
-        raise OSError(error, "Cannot set the replacement DACL.", str(destination))
+        raise OSError(error, "Cannot set the replacement security descriptor.", str(destination))
+    replacement_descriptor = read_security_descriptor(destination)
+    if not equal_sid(owner_sid(descriptor, source), owner_sid(replacement_descriptor, destination)):
+        raise OSError("The replacement configuration owner does not match the source.")
 
 
 def _copy_security_metadata(source: Path, destination: Path) -> None:
@@ -185,10 +254,10 @@ def _copy_security_metadata(source: Path, destination: Path) -> None:
 
     try:
         # On POSIX, copystat copies available extended attributes, including the
-        # system POSIX ACL. Windows needs the DACL copied separately.
+        # system POSIX ACL. Windows needs the security descriptor copied separately.
         shutil.copystat(source, destination, follow_symlinks=False)
         if os.name == "nt":
-            _copy_windows_dacl(source, destination)
+            _copy_windows_security_descriptor(source, destination)
     except OSError as exc:
         raise ConfigWriteUnavailable(
             "The configuration security metadata cannot be copied."
