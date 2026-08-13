@@ -273,8 +273,16 @@ def test_conditional_update_fails_closed_when_owner_copy_fails(tmp_path, monkeyp
     def fail_owner_copy(*_args, **_kwargs) -> None:
         raise OSError("access denied")
 
+    class WindowsOsProxy:
+        """Expose Windows mode without changing the shared os module."""
+
+        name = "nt"
+
+        def __getattr__(self, name: str):
+            return getattr(os, name)
+
     monkeypatch.setattr(writer, "_copy_windows_security_descriptor", fail_owner_copy)
-    monkeypatch.setattr(writer.os, "name", "nt")
+    monkeypatch.setattr(writer, "os", WindowsOsProxy())
     with pytest.raises(writer.ConfigWriteUnavailable, match="security metadata"):
         writer.conditional_roundtrip_yaml_update(
             config_path,
