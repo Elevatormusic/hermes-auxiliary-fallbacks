@@ -13,15 +13,15 @@ This project must not change the Hermes Agent source tree or Electron applicatio
 <HERMES_HOME>/desktop-plugins/auxiliary-fallbacks/
 ```
 
-The installer rejects a Hermes home that is equal to or inside the Hermes Agent source directory.
+The installer and removal script reject a Hermes home that is inside any detected Hermes Agent source directory. This check also covers a source checkout that differs from the selected Hermes runtime. The scripts also reject a reparse-point ancestor that can redirect the selected home.
 
 ## Script effects
 
 | File | Local writes | Network use |
 |---|---|---|
-| `scripts/install.ps1` | Copies the two plugin folders, updates the Hermes plugin allow-list, and makes dated backups. It restores the prior state if an operation fails. | None, unless `-RestartGateway` starts a configured Hermes gateway that uses the network. |
-| `scripts/uninstall.ps1` | Moves the two plugin folders to a dated backup and updates the plugin allow-list. It does not remove saved fallback chains. | None, unless `-RestartGateway` starts a configured Hermes gateway that uses the network. |
-| `scripts/plugin_state.py` | Changes only the Hermes plugin allow-list for the selected profile. | None. |
+| `scripts/install.ps1` | Copies the two plugin folders, updates the Hermes plugin allow-list, and makes dated backups. Rollback reverses only this plugin's allow-list membership. It keeps unrelated current settings. It moves failed copied folders to the backup instead of deleting them. | None, unless `-RestartGateway` starts a configured Hermes gateway that uses the network. |
+| `scripts/uninstall.ps1` | Moves the two plugin folders to a dated backup and updates the plugin allow-list. It does not remove saved fallback chains. Rollback reverses only this plugin's allow-list membership and keeps unrelated current settings. | None, unless `-RestartGateway` starts a configured Hermes gateway that uses the network. |
+| `scripts/plugin_state.py` | Changes only the Hermes plugin allow-list for the selected profile. It writes a transaction receipt and a persistent `.config.yaml.auxiliary-fallbacks.lock` sidecar. The sidecar serializes this extension's config transactions. Rollback rejects a conflicting membership. | None. |
 | `scripts/profile_targets.py` | No writes. It resolves existing Hermes profile paths. | None. |
 | `scripts/vision_fallback_smoke.py` | Creates one UUID-named temporary profile. It removes that profile after a clean test and preserves it if protected data changes. | Sends the selected image to the configured fallback provider. This action can use quota or incur cost. |
 

@@ -44,22 +44,38 @@ class PluginStateTests(TestCase):
         """Create a small Hermes configuration runtime."""
         state = {
             "config": {"plugins": {"enabled": [], "disabled": []}},
+            "read_calls": 0,
             "save_calls": 0,
         }
 
         def load_config():
+            state["read_calls"] += 1
+            hook = state.get("on_read")
+            if hook is not None:
+                hook(state)
             return copy.deepcopy(state["config"])
 
-        def save_config(config):
+        def save_config(config, *, preserve_keys=None, merge_existing=False):
             state["save_calls"] += 1
+            state["save_options"] = {
+                "preserve_keys": preserve_keys,
+                "merge_existing": merge_existing,
+            }
             if persist:
-                state["config"] = copy.deepcopy(config)
+                if merge_existing:
+                    merged = copy.deepcopy(state["config"])
+                    for key, value in config.items():
+                        merged[key] = copy.deepcopy(value)
+                    state["config"] = merged
+                else:
+                    state["config"] = copy.deepcopy(config)
 
         package = types.ModuleType("hermes_cli")
         package.__path__ = []
         config = types.ModuleType("hermes_cli.config")
         config.is_managed = lambda: managed
-        config.load_config = load_config
+        config.get_config_path = lambda: self.fixture / "home" / "config.yaml"
+        config.read_raw_config = load_config
         config.save_config = save_config
         constants = types.ModuleType("hermes_constants")
         constants.set_hermes_home_override = lambda _path: object()
@@ -70,7 +86,12 @@ class PluginStateTests(TestCase):
             "hermes_constants": constants,
         }
 
-    def run_action(self, action: str, modules: dict[str, types.ModuleType]) -> int:
+    def run_action(
+        self,
+        action: str,
+        modules: dict[str, types.ModuleType],
+        receipt: Path | None = None,
+    ) -> int:
         """Run one helper action with the test runtime."""
         script = load_script()
         argv = [
@@ -80,6 +101,8 @@ class PluginStateTests(TestCase):
             str(self.fixture),
             "--hermes-home",
             str(self.fixture / "home"),
+            "--receipt",
+            str(receipt or (self.fixture / f"{action}.receipt.json")),
         ]
         with mock.patch.dict(sys.modules, modules), mock.patch.object(sys, "argv", argv):
             return script.main()
@@ -92,15 +115,18 @@ class PluginStateTests(TestCase):
 
     def test_silent_save_is_rejected(self) -> None:
         state, modules = self.modules(managed=False, persist=False)
+        receipt = self.fixture / "silent.receipt.json"
         with self.assertRaisesRegex(SystemExit, "did not persist"):
-            self.run_action("enable", modules)
+            self.run_action("enable", modules, receipt)
         self.assertEqual(state["save_calls"], 1)
+        self.assertTrue(receipt.is_file())
 
     def test_enable_is_verified_after_save(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
         self.assertEqual(self.run_action("enable", modules), 0)
         self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
         self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+        self.assertTrue(state["save_options"]["merge_existing"])
 
     def test_disable_is_verified_after_save(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
@@ -108,6 +134,70 @@ class PluginStateTests(TestCase):
         self.assertEqual(self.run_action("disable", modules), 0)
         self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
         self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+
+    def test_rollback_preserves_unrelated_current_settings(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.fixture / "rollback.receipt.json"
+        self.assertEqual(self.run_action("enable", modules, receipt), 0)
+
+        state["config"]["theme"] = "current-user-value"
+        state["config"]["plugins"]["enabled"].append("another-plugin")
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+
+        self.assertEqual(state["config"]["theme"], "current-user-value")
+        self.assertEqual(state["config"]["plugins"]["enabled"], ["another-plugin"])
+        self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+
+    def test_rollback_rejects_target_membership_drift(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.fixture / "drift.receipt.json"
+        self.assertEqual(self.run_action("enable", modules, receipt), 0)
+        state["config"]["plugins"]["disabled"].append("auxiliary-fallbacks")
+        save_calls = state["save_calls"]
+
+        with self.assertRaisesRegex(SystemExit, "changed during the operation"):
+            self.run_action("rollback", modules, receipt)
+
+        self.assertEqual(state["save_calls"], save_calls)
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+
+    def test_prepared_receipt_does_not_undo_matching_external_change(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.fixture / "prepared.receipt.json"
+        script = load_script()
+        script._write_receipt(
+            receipt,
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        state["config"]["plugins"]["enabled"].append("auxiliary-fallbacks")
+
+        with self.assertRaisesRegex(SystemExit, "not marked applied"):
+            self.run_action("rollback", modules, receipt)
+
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_apply_rejects_config_change_before_save(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        config_path = self.fixture / "home" / "config.yaml"
+        config_path.parent.mkdir(parents=True)
+
+        def change_on_second_read(runtime_state) -> None:
+            if runtime_state["read_calls"] == 2:
+                config_path.write_text("theme: concurrent\n", encoding="utf-8")
+                runtime_state["config"]["theme"] = "concurrent"
+
+        state["on_read"] = change_on_second_read
+        receipt = self.fixture / "concurrent.receipt.json"
+        with self.assertRaisesRegex(SystemExit, "configuration changed"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertEqual(state["save_calls"], 0)
+        self.assertEqual(state["config"]["theme"], "concurrent")
+        self.assertTrue(receipt.is_file())
 
 
 if __name__ == "__main__":

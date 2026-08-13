@@ -51,32 +51,37 @@ function Assert-SafePath([string]$Root, [string]$Path, [bool]$AllowRoot = $false
     $FullPath
 }
 
-function Get-ConfigSnapshot([string]$Path) {
-    if (Test-Path -LiteralPath $Path -PathType Container) {
-        throw "The Hermes configuration path is a directory: $Path"
+function Assert-NoReparseAncestors([string]$Path) {
+    $FullPath = Resolve-NormalizedPath $Path
+    $RootPath = [IO.Path]::GetPathRoot($FullPath)
+    $Current = $RootPath
+    $Relative = $FullPath.Substring($RootPath.Length)
+    foreach ($Part in @($Relative -split '[\\/]')) {
+        if ($Part) { $Current = Join-Path $Current $Part }
+        if (-not (Test-Path -LiteralPath $Current)) { break }
+        $Item = Get-Item -Force -LiteralPath $Current
+        if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "A reparse point can redirect the selected Hermes home: $Current"
+        }
     }
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        return @{ Exists = $true; Bytes = [IO.File]::ReadAllBytes($Path) }
-    }
-    @{ Exists = $false; Bytes = $null }
+    $FullPath
 }
 
-function Restore-ConfigSnapshot([string]$Path, [hashtable]$Snapshot, [string]$Id) {
-    if (-not $Snapshot.Exists) {
-        if (Test-Path -LiteralPath $Path) { Remove-Item -Force -LiteralPath $Path }
-        return
+function Find-HermesSourceRoot([string]$Path) {
+    $Current = Resolve-NormalizedPath $Path
+    while ($Current) {
+        $HasConfigModule = Test-Path -LiteralPath (Join-Path $Current "hermes_cli\config.py") -PathType Leaf
+        $HasConstants = Test-Path -LiteralPath (Join-Path $Current "hermes_constants.py") -PathType Leaf
+        $HasProject = Test-Path -LiteralPath (Join-Path $Current "pyproject.toml") -PathType Leaf
+        if ($HasConfigModule -and $HasConstants -and $HasProject) { return $Current }
+
+        $Parent = [IO.Directory]::GetParent($Current)
+        if ($null -eq $Parent) { break }
+        $ParentPath = Resolve-NormalizedPath $Parent.FullName
+        if ($ParentPath.Equals($Current, [StringComparison]::OrdinalIgnoreCase)) { break }
+        $Current = $ParentPath
     }
-    $TemporaryPath = "$Path.$Id.rollback"
-    try {
-        [IO.File]::WriteAllBytes($TemporaryPath, [byte[]]$Snapshot.Bytes)
-        if (Test-Path -LiteralPath $Path -PathType Leaf) {
-            [IO.File]::Replace($TemporaryPath, $Path, $null)
-        }
-        else { [IO.File]::Move($TemporaryPath, $Path) }
-    }
-    finally {
-        if (Test-Path -LiteralPath $TemporaryPath) { Remove-Item -Force -LiteralPath $TemporaryPath }
-    }
+    $null
 }
 
 function Invoke-GatewayRestart([string]$Command, [string]$TargetHome) {
@@ -123,6 +128,11 @@ $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 foreach ($SelectedProfile in $SelectedProfiles) {
     $TargetHome = Resolve-NormalizedPath ([string]$SelectedProfile.path)
     if (-not (Test-Path -LiteralPath $TargetHome -PathType Container)) { throw "The selected Hermes profile home was not found: $TargetHome" }
+    $TargetHome = Assert-NoReparseAncestors $TargetHome
+    $DetectedSourceRoot = Find-HermesSourceRoot $TargetHome
+    if ($null -ne $DetectedSourceRoot) {
+        throw "A Hermes profile home cannot be inside a Hermes Agent source directory: $DetectedSourceRoot"
+    }
     $AgentPrefix = $ResolvedAgent + [IO.Path]::DirectorySeparatorChar
     if (
         $TargetHome.Equals($ResolvedAgent, [StringComparison]::OrdinalIgnoreCase) -or
@@ -135,6 +145,8 @@ foreach ($SelectedProfile in $SelectedProfiles) {
     $DesktopTarget = Assert-SafePath $TargetHome (Join-Path $TargetHome "desktop-plugins\$PluginId")
     $ConfigPath = Assert-SafePath $TargetHome (Join-Path $TargetHome "config.yaml")
     $BackupRoot = Assert-SafePath $TargetHome (Join-Path $TargetHome "plugin-backups\removed-$PluginId-$Stamp-$RunId")
+    $ReceiptPath = Assert-SafePath $TargetHome (Join-Path $BackupRoot "transaction.json")
+    if (Test-Path -LiteralPath $ReceiptPath) { throw "The transaction receipt path already exists: $ReceiptPath" }
     foreach ($Target in @($AgentTarget, $DesktopTarget)) {
         if (Test-Path -LiteralPath $Target -PathType Leaf) { throw "The plugin target is a file: $Target" }
     }
@@ -149,27 +161,37 @@ foreach ($SelectedProfile in $SelectedProfiles) {
         Name = [string]$SelectedProfile.name
         Home = $TargetHome
         ConfigPath = $ConfigPath
-        ConfigSnapshot = Get-ConfigSnapshot $ConfigPath
+        ReceiptPath = $ReceiptPath
         BackupRoot = $BackupRoot
         Existing = $Existing
         ConfigMutationAttempted = $false
+        ConfigMutationCompleted = $false
         RestartAttempted = $false
     }
 }
 
 try {
     foreach ($Plan in $Plans) {
+        $Plan.Home = Assert-NoReparseAncestors $Plan.Home
+        New-Item -ItemType Directory -Path $Plan.BackupRoot | Out-Null
+        $Plan.BackupRoot = Assert-SafePath $Plan.Home $Plan.BackupRoot
         if ($Plan.Existing.Count -gt 0) {
-            New-Item -ItemType Directory -Path $Plan.BackupRoot | Out-Null
-            $Plan.BackupRoot = Assert-SafePath $Plan.Home $Plan.BackupRoot
             foreach ($Item in $Plan.Existing) {
+                $Plan.Home = Assert-NoReparseAncestors $Plan.Home
+                $Item.Source = Assert-SafePath $Plan.Home $Item.Source
+                $Item.Destination = Assert-SafePath $Plan.Home $Item.Destination
                 Move-Item -LiteralPath $Item.Source -Destination $Item.Destination
                 $Item.Moved = $true
             }
         }
+        $Plan.Home = Assert-NoReparseAncestors $Plan.Home
+        $Plan.ConfigPath = Assert-SafePath $Plan.Home $Plan.ConfigPath
+        $Plan.ReceiptPath = Assert-SafePath $Plan.Home $Plan.ReceiptPath
         $Plan.ConfigMutationAttempted = $true
-        & $Python -B (Join-Path $PSScriptRoot "plugin_state.py") disable --hermes-agent $ResolvedAgent --hermes-home $Plan.Home
-        if ($LASTEXITCODE -ne 0) { throw "Hermes did not disable the backend plugin for $($Plan.Name)." }
+        & $Python -B (Join-Path $PSScriptRoot "plugin_state.py") disable --hermes-agent $ResolvedAgent --hermes-home $Plan.Home --receipt $Plan.ReceiptPath
+        $PluginStateExitCode = $LASTEXITCODE
+        if ($PluginStateExitCode -ne 0) { throw "Hermes did not disable the backend plugin for $($Plan.Name)." }
+        $Plan.ConfigMutationCompleted = $true
     }
 
     if ($RestartGateway) {
@@ -185,9 +207,30 @@ catch {
     $RollbackPlans = @($Plans)
     [array]::Reverse($RollbackPlans)
     foreach ($Plan in $RollbackPlans) {
-        if ($Plan.ConfigMutationAttempted) {
-            try { Restore-ConfigSnapshot $Plan.ConfigPath $Plan.ConfigSnapshot $RunId }
-            catch { $RollbackErrors.Add("Could not restore the configuration for $($Plan.Name): $($_.Exception.Message)") }
+        try { $Plan.Home = Assert-NoReparseAncestors $Plan.Home }
+        catch {
+            $RollbackErrors.Add("The profile path changed before rollback for $($Plan.Name): $($_.Exception.Message)")
+            continue
+        }
+        if ($Plan.ConfigMutationCompleted) {
+            if (Test-Path -LiteralPath $Plan.ReceiptPath -PathType Leaf) {
+                try {
+                    $Plan.ConfigPath = Assert-SafePath $Plan.Home $Plan.ConfigPath
+                    $Plan.ReceiptPath = Assert-SafePath $Plan.Home $Plan.ReceiptPath
+                    & $Python -B (Join-Path $PSScriptRoot "plugin_state.py") rollback --hermes-agent $ResolvedAgent --hermes-home $Plan.Home --receipt $Plan.ReceiptPath
+                    if ($LASTEXITCODE -ne 0) { throw "Hermes did not roll back the plugin allow-list." }
+                    Remove-Item -Force -LiteralPath $Plan.ReceiptPath
+                }
+                catch {
+                    $RollbackErrors.Add("Could not restore the plugin allow-list for $($Plan.Name): $($_.Exception.Message). Receipt: $($Plan.ReceiptPath)")
+                }
+            }
+            else {
+                $RollbackErrors.Add("No transaction receipt was available for $($Plan.Name). No plugin allow-list rollback was attempted.")
+            }
+        }
+        elseif ($Plan.ConfigMutationAttempted) {
+            $RollbackErrors.Add("The plugin allow-list helper did not complete for $($Plan.Name). The current configuration was preserved. Receipt: $($Plan.ReceiptPath)")
         }
         foreach ($Item in $Plan.Existing) {
             if (-not $Item.Moved) { continue }
@@ -214,6 +257,15 @@ catch {
 }
 
 foreach ($Plan in $Plans) {
+    if (Test-Path -LiteralPath $Plan.ReceiptPath -PathType Leaf) {
+        try { Remove-Item -Force -LiteralPath $Plan.ReceiptPath }
+        catch { Write-Warning "Could not remove the completed transaction receipt: $($Plan.ReceiptPath)" }
+    }
+    if ($Plan.Existing.Count -eq 0 -and (Test-Path -LiteralPath $Plan.BackupRoot -PathType Container)) {
+        if (@(Get-ChildItem -Force -LiteralPath $Plan.BackupRoot).Count -eq 0) {
+            Remove-Item -Force -LiteralPath $Plan.BackupRoot
+        }
+    }
     if ($Plan.Existing.Count -gt 0) { Write-Output "$($Plan.Name) plugin files moved to $($Plan.BackupRoot)" }
 }
 Write-Output "Saved fallback chains were not removed."
