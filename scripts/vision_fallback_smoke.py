@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import sys
 import threading
 import uuid
@@ -199,6 +200,35 @@ def assert_safe_temp_profile(temp_dir: Path, profiles_root: Path, profile_name: 
         raise RuntimeError(f"The temporary profile is outside the profiles root: {temp_dir}")
 
 
+def source_marker_is_file(path: Path) -> bool:
+    """Return true for a marker file and fail on inspection errors."""
+
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise SystemExit("The Hermes root cannot be inspected.") from exc
+
+
+def find_hermes_source_root(path: Path) -> Path | None:
+    """Find a Hermes Agent source root at or above a selected data root."""
+
+    current = path
+    while True:
+        is_source = (
+            source_marker_is_file(current / "hermes_cli" / "config.py")
+            and source_marker_is_file(current / "hermes_constants.py")
+            and source_marker_is_file(current / "pyproject.toml")
+        )
+        if is_source:
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
 def main() -> int:
     """Save a role chain through the plugin, then run a real Vision fallback."""
     args = parse_args()
@@ -223,6 +253,12 @@ def main() -> int:
         raise SystemExit(f"The plugin API was not found: {plugin_api_path}")
     if not hermes_root.is_dir():
         raise SystemExit(f"The Hermes root was not found: {hermes_root}")
+    source_root = find_hermes_source_root(hermes_root)
+    if source_root is not None:
+        raise SystemExit(
+            "The Hermes root cannot be inside a Hermes Agent source directory: "
+            f"{source_root}"
+        )
 
     root_config_path = hermes_root / "config.yaml"
     active_profile_path = hermes_root / "active_profile"

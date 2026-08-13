@@ -388,16 +388,55 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> Callab
     return verify_source_unchanged
 
 
+def _copy_posix_ownership(source: Path, destination: Path) -> Callable[[], None]:
+    """Set and verify the POSIX owner before replacement."""
+
+    def owner(path: Path) -> tuple[int, int]:
+        """Return the exact owner of one file without following a link."""
+
+        path_stat = os.stat(path, follow_symlinks=False)
+        return path_stat.st_uid, path_stat.st_gid
+
+    source_owner = owner(source)
+    if owner(destination) != source_owner:
+        chown = getattr(os, "chown", None)
+        if not callable(chown):
+            raise OSError("POSIX ownership changes are not available.")
+        chown(
+            destination,
+            source_owner[0],
+            source_owner[1],
+            follow_symlinks=False,
+        )
+    if owner(destination) != source_owner:
+        raise OSError("The replacement configuration owner does not match the source.")
+
+    def verify_ownership_unchanged() -> None:
+        """Reject an ownership change before replacement."""
+
+        if owner(source) != source_owner:
+            raise OSError("The configuration owner changed during the write.")
+        if owner(destination) != source_owner:
+            raise OSError("The replacement configuration owner changed during the write.")
+
+    return verify_ownership_unchanged
+
+
 def _copy_security_metadata(source: Path, destination: Path) -> Callable[[], None] | None:
     """Copy access metadata before the replacement becomes the configuration."""
 
     try:
+        ownership_verifier: Callable[[], None] | None = None
+        if os.name == "posix":
+            ownership_verifier = _copy_posix_ownership(source, destination)
         # On POSIX, copystat copies available extended attributes, including the
         # system POSIX ACL. Windows needs the security descriptor copied separately.
         shutil.copystat(source, destination, follow_symlinks=False)
+        if ownership_verifier is not None:
+            return ownership_verifier
         if os.name == "nt":
             return _copy_windows_security_descriptor(source, destination)
-    except OSError as exc:
+    except (OSError, NotImplementedError) as exc:
         raise ConfigWriteUnavailable(
             "The configuration security metadata cannot be copied."
         ) from exc
@@ -481,12 +520,9 @@ def conditional_roundtrip_yaml_update(
     current[keys[-1]] = value
 
     original_mode: int | None = None
-    original_owner: tuple[int, int] | None = None
     try:
         target_stat = target.stat()
         original_mode = stat.S_IMODE(target_stat.st_mode)
-        if os.name == "posix":
-            original_owner = (target_stat.st_uid, target_stat.st_gid)
     except FileNotFoundError:
         pass
     except OSError as exc:
@@ -537,11 +573,6 @@ def conditional_roundtrip_yaml_update(
             ) from exc
         real_path = target
 
-        if original_owner is not None and hasattr(os, "chown"):
-            try:
-                os.chown(real_path, original_owner[0], original_owner[1])
-            except OSError:
-                pass
         if original_mode is not None:
             try:
                 os.chmod(real_path, original_mode)

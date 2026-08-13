@@ -13,7 +13,7 @@ This project must not change the Hermes Agent source tree or Electron applicatio
 <HERMES_HOME>/desktop-plugins/auxiliary-fallbacks/
 ```
 
-The installer, removal script, and backend requests reject a Hermes home that is inside any detected Hermes Agent source directory. This check also covers a source checkout that differs from the selected Hermes runtime. They reject a symlink, junction, or other reparse-point ancestor that can redirect the selected home or `config.yaml`.
+The installer, removal script, Vision smoke test, and backend requests reject a Hermes home that is inside any detected Hermes Agent source directory. This check also covers a source checkout that differs from the selected Hermes runtime. The installer, removal script, and backend requests also reject a symlink, junction, or other reparse-point ancestor that can redirect the selected home or `config.yaml`.
 
 ## Script effects
 

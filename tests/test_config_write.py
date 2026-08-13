@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import types
 import uuid
 from pathlib import Path
 
@@ -227,8 +228,11 @@ def test_conditional_update_preserves_comments_and_unrelated_values(tmp_path):
         "    fallback_chain: []\n",
         encoding="utf-8",
     )
+    original_owner: tuple[int, int] | None = None
     if os.name == "posix":
         config_path.chmod(0o640)
+        original_stat = config_path.stat()
+        original_owner = (original_stat.st_uid, original_stat.st_gid)
 
     result = writer.conditional_roundtrip_yaml_update(
         config_path,
@@ -248,6 +252,8 @@ def test_conditional_update_preserves_comments_and_unrelated_values(tmp_path):
     ]
     if os.name == "posix":
         assert stat.S_IMODE(config_path.stat().st_mode) == 0o640
+        current_stat = config_path.stat()
+        assert (current_stat.st_uid, current_stat.st_gid) == original_owner
     assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
 
 
@@ -325,6 +331,55 @@ def test_conditional_update_fails_closed_when_owner_copy_fails(tmp_path, monkeyp
             writer.config_revision(config_path),
         )
 
+    assert config_path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
+
+
+def test_conditional_update_fails_before_replace_for_wrong_posix_owner(
+    tmp_path,
+    monkeypatch,
+):
+    """Do not replace a POSIX file when its owner cannot be copied."""
+
+    writer = load_writer()
+    config_path = tmp_path / "config.yaml"
+    original = "theme: gold\n"
+    config_path.write_text(original, encoding="utf-8")
+    replace_calls: list[tuple[Path, Path]] = []
+
+    class PosixOsProxy:
+        """Expose different POSIX owners without changing the host."""
+
+        name = "posix"
+
+        def __getattr__(self, name: str):
+            return getattr(os, name)
+
+        @staticmethod
+        def stat(path, *, follow_symlinks=True):
+            del follow_symlinks
+            if Path(path) == config_path:
+                return types.SimpleNamespace(st_uid=1001, st_gid=1001)
+            return types.SimpleNamespace(st_uid=2002, st_gid=2002)
+
+        @staticmethod
+        def chown(*_args, **_kwargs) -> None:
+            raise OSError("owner change denied")
+
+        @staticmethod
+        def replace(source, destination) -> None:
+            replace_calls.append((Path(source), Path(destination)))
+
+    monkeypatch.setattr(writer, "os", PosixOsProxy())
+    with pytest.raises(writer.ConfigWriteUnavailable, match="security metadata"):
+        writer.conditional_roundtrip_yaml_update(
+            config_path,
+            "auxiliary.vision.fallback_chain",
+            [],
+            writer.config_revision(config_path),
+        )
+
+    assert replace_calls == []
     assert config_path.read_text(encoding="utf-8") == original
     assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
 

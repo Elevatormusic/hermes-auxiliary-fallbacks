@@ -13,6 +13,7 @@ All notable changes to this project are listed in this file.
 - Keep transaction receipts in the selected Hermes home. Validate each receipt before read, write, replace, or delete.
 - Keep profile target paths lexical so safety checks can detect redirects.
 - Read smoke-test provider settings from the active Hermes profile.
+- Reject a smoke-test data root inside a Hermes Agent source directory.
 - Validate direct helper homes and configuration paths before an override or write.
 
 ## 1.0.0 - 2026-08-13
