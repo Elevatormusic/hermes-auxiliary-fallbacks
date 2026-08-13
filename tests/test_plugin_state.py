@@ -31,6 +31,7 @@ class PluginStateTests(TestCase):
     def setUp(self) -> None:
         self.fixture = Path(__file__).parent / f"state-fixture-{uuid.uuid4().hex}"
         (self.fixture / "hermes_cli").mkdir(parents=True)
+        (self.fixture / "home").mkdir()
         (self.fixture / "hermes_cli" / "config.py").write_text("", encoding="utf-8")
 
     def tearDown(self) -> None:
@@ -146,10 +147,15 @@ class PluginStateTests(TestCase):
             "--hermes-home",
             str(self.fixture / "home"),
             "--receipt",
-            str(receipt or (self.fixture / f"{action}.receipt.json")),
+            str(receipt or (self.fixture / "home" / f"{action}.receipt.json")),
         ]
         with mock.patch.dict(sys.modules, modules), mock.patch.object(sys, "argv", argv):
             return script.main()
+
+    def receipt_path(self, name: str) -> Path:
+        """Return one receipt path inside the test profile home."""
+
+        return self.fixture / "home" / name
 
     def test_managed_profile_is_rejected_before_save(self) -> None:
         state, modules = self.modules(managed=True, persist=True)
@@ -184,9 +190,168 @@ class PluginStateTests(TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(state["save_calls"], 0)
 
+    def test_receipt_path_rejects_outside_sibling_and_source_paths(self) -> None:
+        """Reject receipt paths outside the safe profile home."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        outside = self.fixture.parent / f"outside-{uuid.uuid4().hex}.json"
+        sibling = self.fixture / "home-other" / "transaction.json"
+        source = home / "source" / "transaction.json"
+        (source.parent / "hermes_cli").mkdir(parents=True)
+        (source.parent / "hermes_cli" / "config.py").write_text("", encoding="utf-8")
+        (source.parent / "hermes_constants.py").write_text("", encoding="utf-8")
+        (source.parent / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, outside)
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, sibling)
+        with self.assertRaisesRegex(SystemExit, "source directory"):
+            script._validate_receipt_path(home, source)
+
+    def test_receipt_path_rejects_a_redirected_ancestor(self) -> None:
+        """Reject a receipt path with a redirected existing ancestor."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = home / "backup" / "transaction.json"
+        script._is_reparse_point = lambda candidate: candidate == receipt.parent
+
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            script._validate_receipt_path(home, receipt)
+
+    def test_receipt_write_rejects_redirect_before_open(self) -> None:
+        """Reject a receipt redirect introduced before its first open."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("before-open.json")
+        external = self.fixture / f"external-{uuid.uuid4().hex}.json"
+        external.write_text("keep", encoding="utf-8")
+        validate = script._validate_receipt_path
+        calls = 0
+
+        def redirect_before_open(current_home, path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise SystemExit("The Hermes profile path uses a redirected path.")
+            return validate(current_home, path)
+
+        try:
+            script._validate_receipt_path = redirect_before_open
+            with self.assertRaisesRegex(SystemExit, "redirected path"):
+                script._write_receipt(
+                    receipt,
+                    home=home,
+                    action="enable",
+                    before={"enabled": False, "disabled": False},
+                    after={"enabled": True, "disabled": False},
+                )
+            self.assertFalse(receipt.exists())
+            self.assertEqual(external.read_text(encoding="utf-8"), "keep")
+        finally:
+            external.unlink(missing_ok=True)
+
+    def test_receipt_replace_rejects_redirect_before_replace(self) -> None:
+        """Reject a receipt redirect introduced before its atomic replacement."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("before-replace.json")
+        script._write_receipt(
+            receipt,
+            home=home,
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        validate = script._validate_receipt_path
+        calls = 0
+
+        def redirect_before_replace(current_home, path):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise SystemExit("The Hermes profile path uses a redirected path.")
+            return validate(current_home, path)
+
+        script._validate_receipt_path = redirect_before_replace
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            script._replace_receipt(receipt, {"status": "prepared"}, home=home)
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(
+            script._read_receipt(receipt, home=home)["status"],
+            "prepared",
+        )
+        self.assertEqual(list(home.glob(".before-replace.json.*.tmp")), [])
+
+    def test_receipt_cleanup_skips_redirected_temporary_path(self) -> None:
+        """Do not delete a temporary receipt after a redirect is detected."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("before-cleanup.json")
+        script._write_receipt(
+            receipt,
+            home=home,
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        validate = script._validate_receipt_path
+        calls = 0
+
+        def redirect_before_cleanup(current_home, path):
+            nonlocal calls
+            calls += 1
+            if calls == 5:
+                raise SystemExit("The Hermes profile path uses a redirected path.")
+            return validate(current_home, path)
+
+        script._validate_receipt_path = redirect_before_cleanup
+        with mock.patch.object(Path, "unlink", side_effect=AssertionError("unlink ran")):
+            script._replace_receipt(receipt, {"status": "prepared"}, home=home)
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(list(home.glob(".before-cleanup.json.*.tmp")), [])
+
+    def test_receipt_read_rejects_redirect_before_open(self) -> None:
+        """Reject a redirected receipt before rollback can read it."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("rollback-read.json")
+        script._write_receipt(
+            receipt,
+            home=home,
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        script._validate_receipt_path = lambda *_args: (_ for _ in ()).throw(
+            SystemExit("The Hermes profile path uses a redirected path.")
+        )
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            script._read_receipt(receipt, home=home)
+
+    def test_receipt_read_error_does_not_expose_content_or_path(self) -> None:
+        """Report receipt read errors with fixed text only."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("read-error.json")
+        receipt.write_text("api_key: must-not-leak", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "transaction receipt is not valid") as caught:
+            script._read_receipt(receipt, home=home)
+
+        self.assertNotIn("must-not-leak", str(caught.exception))
+        self.assertNotIn(str(receipt), str(caught.exception))
+
     def test_silent_save_is_rejected(self) -> None:
         state, modules = self.modules(managed=False, persist=False)
-        receipt = self.fixture / "silent.receipt.json"
+        receipt = self.receipt_path("silent.receipt.json")
         with self.assertRaisesRegex(SystemExit, "did not persist"):
             self.run_action("enable", modules, receipt)
         self.assertEqual(state["save_calls"], 1)
@@ -208,7 +373,7 @@ class PluginStateTests(TestCase):
 
     def test_rollback_preserves_unrelated_current_settings(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
-        receipt = self.fixture / "rollback.receipt.json"
+        receipt = self.receipt_path("rollback.receipt.json")
         self.assertEqual(self.run_action("enable", modules, receipt), 0)
 
         state["config"]["theme"] = "current-user-value"
@@ -221,7 +386,7 @@ class PluginStateTests(TestCase):
 
     def test_rollback_rejects_target_membership_drift(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
-        receipt = self.fixture / "drift.receipt.json"
+        receipt = self.receipt_path("drift.receipt.json")
         self.assertEqual(self.run_action("enable", modules, receipt), 0)
         state["config"]["plugins"]["disabled"].append("auxiliary-fallbacks")
         save_calls = state["save_calls"]
@@ -235,10 +400,11 @@ class PluginStateTests(TestCase):
 
     def test_prepared_receipt_does_not_undo_matching_external_change(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
-        receipt = self.fixture / "prepared.receipt.json"
+        receipt = self.receipt_path("prepared.receipt.json")
         script = load_script()
         script._write_receipt(
             receipt,
+            home=self.fixture / "home",
             action="enable",
             before={"enabled": False, "disabled": False},
             after={"enabled": True, "disabled": False},
@@ -253,7 +419,7 @@ class PluginStateTests(TestCase):
     def test_apply_rejects_config_change_before_save(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
         config_path = self.fixture / "home" / "config.yaml"
-        config_path.parent.mkdir(parents=True)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
 
         def change_on_second_read(runtime_state) -> None:
             if runtime_state["read_calls"] == 2:
@@ -261,7 +427,7 @@ class PluginStateTests(TestCase):
                 runtime_state["config"]["theme"] = "concurrent"
 
         state["on_read"] = change_on_second_read
-        receipt = self.fixture / "concurrent.receipt.json"
+        receipt = self.receipt_path("concurrent.receipt.json")
         with self.assertRaisesRegex(SystemExit, "configuration changed"):
             self.run_action("enable", modules, receipt)
 
@@ -269,7 +435,7 @@ class PluginStateTests(TestCase):
         self.assertEqual(state["config"]["theme"], "concurrent")
         self.assertTrue(receipt.is_file())
         self.assertEqual(
-            load_script()._read_receipt(receipt)["status"],
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
             "prepared",
         )
 
@@ -283,11 +449,14 @@ class PluginStateTests(TestCase):
                 )
 
         state["on_read"] = enable_on_second_read
-        receipt = self.fixture / "external.receipt.json"
+        receipt = self.receipt_path("external.receipt.json")
         with self.assertRaisesRegex(SystemExit, "allow-list changed"):
             self.run_action("enable", modules, receipt)
 
-        self.assertEqual(load_script()._read_receipt(receipt)["status"], "prepared")
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "prepared",
+        )
         self.assertEqual(self.run_action("rollback", modules, receipt), 0)
         self.assertIn(
             "auxiliary-fallbacks",
@@ -298,7 +467,7 @@ class PluginStateTests(TestCase):
     def test_change_after_receipt_arm_is_not_overwritten(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
         config_path = self.fixture / "home" / "config.yaml"
-        config_path.parent.mkdir(parents=True)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
 
         def external_write(runtime_state, path) -> None:
             runtime_state["after_receipt"] = None
@@ -306,30 +475,38 @@ class PluginStateTests(TestCase):
             path.write_text("plugins:\n  custom_flag: external\n", encoding="utf-8")
 
         state["after_receipt"] = external_write
-        receipt = self.fixture / "after-arm.receipt.json"
+        receipt = self.receipt_path("after-arm.receipt.json")
         with self.assertRaisesRegex(SystemExit, "configuration changed"):
             self.run_action("enable", modules, receipt)
 
         self.assertEqual(state["save_calls"], 0)
         self.assertEqual(state["config"]["plugins"]["custom_flag"], "external")
-        self.assertEqual(load_script()._read_receipt(receipt)["status"], "armed")
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "armed",
+        )
         self.assertEqual(self.run_action("rollback", modules, receipt), 0)
         self.assertEqual(state["config"]["plugins"]["custom_flag"], "external")
 
     def test_armed_receipt_rejects_a_non_candidate_revision(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
         config_path = self.fixture / "home" / "config.yaml"
-        config_path.parent.mkdir(parents=True)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text("before", encoding="utf-8")
-        receipt = self.fixture / "armed-drift.receipt.json"
+        receipt = self.receipt_path("armed-drift.receipt.json")
         script = load_script()
         script._write_receipt(
             receipt,
+            home=self.fixture / "home",
             action="enable",
             before={"enabled": False, "disabled": False},
             after={"enabled": True, "disabled": False},
         )
-        script._arm_receipt(receipt, "sha256:" + "0" * 64)
+        script._arm_receipt(
+            receipt,
+            "sha256:" + "0" * 64,
+            home=self.fixture / "home",
+        )
         state["config"]["plugins"]["enabled"].append("auxiliary-fallbacks")
         config_path.write_text("external", encoding="utf-8")
 
@@ -349,7 +526,7 @@ class PluginStateTests(TestCase):
             self.run_action(
                 "enable",
                 modules,
-                self.fixture / "finalization.receipt.json",
+                self.receipt_path("finalization.receipt.json"),
                 configure=lambda script: setattr(
                     script,
                     "_arm_receipt",
@@ -365,7 +542,7 @@ class PluginStateTests(TestCase):
 
     def test_writer_error_does_not_expose_configuration_values(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
-        receipt = self.fixture / "safe-error.receipt.json"
+        receipt = self.receipt_path("safe-error.receipt.json")
 
         def fail_with_secret(*_args, **_kwargs) -> None:
             raise RuntimeError("api_key: must-not-leak")
@@ -378,14 +555,17 @@ class PluginStateTests(TestCase):
             self.run_action("enable", modules, receipt)
 
         self.assertNotIn("must-not-leak", str(caught.exception))
-        self.assertEqual(load_script()._read_receipt(receipt)["status"], "prepared")
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "prepared",
+        )
         self.assertEqual(state["save_calls"], 0)
 
     def test_receipt_apply_failure_is_recoverable(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
-        receipt = self.fixture / "apply-failure.receipt.json"
+        receipt = self.receipt_path("apply-failure.receipt.json")
 
-        def fail_receipt(_path) -> None:
+        def fail_receipt(_path, **_kwargs) -> None:
             raise OSError("receipt apply failed")
 
         with self.assertRaisesRegex(OSError, "receipt apply failed"):
@@ -401,13 +581,16 @@ class PluginStateTests(TestCase):
             )
 
         self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
-        self.assertEqual(load_script()._read_receipt(receipt)["status"], "committed")
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "committed",
+        )
         self.assertEqual(self.run_action("rollback", modules, receipt), 0)
         self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
 
     def test_sibling_change_after_replace_is_preserved_by_rollback(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
-        receipt = self.fixture / "after-replace.receipt.json"
+        receipt = self.receipt_path("after-replace.receipt.json")
 
         def external_write(runtime_state, path) -> None:
             runtime_state["after_replace"] = None
@@ -418,7 +601,10 @@ class PluginStateTests(TestCase):
         with self.assertRaisesRegex(SystemExit, "configuration changed"):
             self.run_action("enable", modules, receipt)
 
-        self.assertEqual(load_script()._read_receipt(receipt)["status"], "committed")
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "committed",
+        )
         self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
         self.assertEqual(self.run_action("rollback", modules, receipt), 0)
         self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
@@ -428,7 +614,7 @@ class PluginStateTests(TestCase):
         state, modules = self.modules(managed=False, persist=True)
         utils_module = modules["utils"]
         original_save = utils_module.conditional_writer
-        receipt = self.fixture / "write-then-fail.receipt.json"
+        receipt = self.receipt_path("write-then-fail.receipt.json")
 
         def write_then_fail(*args, **kwargs) -> None:
             original_save(*args, **kwargs)
@@ -442,7 +628,10 @@ class PluginStateTests(TestCase):
             "auxiliary-fallbacks",
             state["config"]["plugins"]["enabled"],
         )
-        self.assertEqual(load_script()._read_receipt(receipt)["status"], "committed")
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "committed",
+        )
 
         utils_module.conditional_writer = original_save
         self.assertEqual(self.run_action("rollback", modules, receipt), 0)

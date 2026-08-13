@@ -169,6 +169,22 @@ def _validate_config_path(home: Path, path: Path) -> Path:
     return config_path
 
 
+def _validate_receipt_path(home: Path, path: Path) -> Path:
+    """Return one receipt path inside the safe Hermes profile home."""
+
+    receipt_path = _absolute_lexical_path(path)
+    home_path = _absolute_lexical_path(home)
+    home_prefix = os.fspath(home_path) + os.sep
+    if not os.path.normcase(os.fspath(receipt_path)).startswith(
+        os.path.normcase(home_prefix)
+    ):
+        raise SystemExit("The transaction receipt is outside the Hermes profile home.")
+    _reject_reparse_ancestors(receipt_path)
+    if _find_hermes_source_root(receipt_path.parent) is not None:
+        raise SystemExit("The transaction receipt is inside a Hermes Agent source directory.")
+    return receipt_path
+
+
 def _plugin_lists(config: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
     """Return valid plugin allow-lists."""
 
@@ -221,14 +237,16 @@ def _desired_membership(action: str) -> dict[str, bool]:
 def _write_receipt(
     path: Path,
     *,
+    home: Path,
     action: str,
     before: Mapping[str, bool],
     after: Mapping[str, bool],
 ) -> None:
     """Create a transaction receipt before the config write."""
 
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _validate_receipt_path(home, path)
+    if not path.parent.is_dir():
+        raise SystemExit("The transaction receipt directory is not available.")
     payload = {
         "version": 2,
         "plugin_id": PLUGIN_ID,
@@ -239,6 +257,7 @@ def _write_receipt(
         "after": dict(after),
     }
     try:
+        path = _validate_receipt_path(home, path)
         with path.open("x", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
             handle.flush()
@@ -247,13 +266,14 @@ def _write_receipt(
         raise SystemExit(f"The transaction receipt already exists: {path}") from exc
 
 
-def _read_receipt(path: Path) -> dict[str, Any]:
+def _read_receipt(path: Path, *, home: Path) -> dict[str, Any]:
     """Read and validate one transaction receipt."""
 
     try:
-        payload = json.loads(path.resolve().read_text(encoding="utf-8"))
+        path = _validate_receipt_path(home, path)
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"The transaction receipt is not valid: {exc}") from exc
+        raise SystemExit("The transaction receipt is not valid.") from exc
     if not isinstance(payload, dict) or set(payload) != {
         "version",
         "plugin_id",
@@ -287,55 +307,61 @@ def _read_receipt(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _replace_receipt(path: Path, payload: Mapping[str, Any]) -> None:
+def _replace_receipt(path: Path, payload: Mapping[str, Any], *, home: Path) -> None:
     """Replace one transaction receipt and flush its complete state."""
 
-    path = path.resolve()
+    path = _validate_receipt_path(home, path)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
+        temporary = _validate_receipt_path(home, temporary)
         with temporary.open("x", encoding="utf-8") as handle:
             json.dump(dict(payload), handle, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
+        path = _validate_receipt_path(home, path)
+        temporary = _validate_receipt_path(home, temporary)
         os.replace(temporary, path)
     finally:
         try:
+            temporary = _validate_receipt_path(home, temporary)
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+        except SystemExit:
+            pass
 
 
-def _arm_receipt(path: Path, candidate_revision: str) -> None:
+def _arm_receipt(path: Path, candidate_revision: str, *, home: Path) -> None:
     """Arm a receipt for one prepared configuration replacement."""
 
-    payload = _read_receipt(path)
+    payload = _read_receipt(path, home=home)
     if payload["status"] != "prepared":
         raise SystemExit("The transaction receipt was not in the prepared state.")
     payload["status"] = "armed"
     payload["candidate_revision"] = candidate_revision
-    _replace_receipt(path, payload)
+    _replace_receipt(path, payload, home=home)
 
 
-def _mark_receipt_applied(path: Path) -> None:
+def _mark_receipt_applied(path: Path, *, home: Path) -> None:
     """Record that the requested configuration write was verified."""
 
-    payload = _read_receipt(path)
+    payload = _read_receipt(path, home=home)
     if payload["status"] != "committed":
         raise SystemExit("The transaction receipt was not in the committed state.")
     payload["status"] = "applied"
-    _replace_receipt(path, payload)
+    _replace_receipt(path, payload, home=home)
 
 
-def _mark_receipt_committed(path: Path, candidate_revision: str) -> None:
+def _mark_receipt_committed(path: Path, candidate_revision: str, *, home: Path) -> None:
     """Record that the prepared configuration replacement completed."""
 
-    payload = _read_receipt(path)
+    payload = _read_receipt(path, home=home)
     if payload["status"] != "armed":
         raise SystemExit("The transaction receipt was not in the armed state.")
     if payload["candidate_revision"] != candidate_revision:
         raise SystemExit("The transaction receipt has a different candidate revision.")
     payload["status"] = "committed"
-    _replace_receipt(path, payload)
+    _replace_receipt(path, payload, home=home)
 
 
 def _config_revision(path: Path) -> str:
@@ -480,6 +506,7 @@ def main() -> int:
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
     home = _validate_hermes_home(args.hermes_home)
+    receipt_path = _validate_receipt_path(home, args.receipt)
     token = set_hermes_home_override(home)
     try:
         from hermes_cli import config as hermes_config
@@ -500,7 +527,7 @@ def main() -> int:
         config_path = _validate_config_path(home, get_config_path())
         with _config_file_lock(config_path):
             if args.action == "rollback":
-                receipt = _read_receipt(args.receipt)
+                receipt = _read_receipt(receipt_path, home=home)
                 if receipt["status"] == "prepared":
                     print(f"{PLUGIN_ID}: rollback complete")
                     return 0
@@ -537,7 +564,8 @@ def main() -> int:
                 before = _membership(config)
                 after = _desired_membership(args.action)
                 _write_receipt(
-                    args.receipt,
+                    receipt_path,
+                    home=home,
                     action=args.action,
                     before=before,
                     after=after,
@@ -552,14 +580,16 @@ def main() -> int:
                     desired=after,
                     operation=args.action,
                     before_save=lambda candidate: _arm_receipt(
-                        args.receipt,
+                        receipt_path,
                         candidate,
+                        home=home,
                     ),
                     after_replace=lambda candidate: _mark_receipt_committed(
-                        args.receipt,
+                        receipt_path,
                         candidate,
+                        home=home,
                     ),
-                    after_save=lambda: _mark_receipt_applied(args.receipt),
+                    after_save=lambda: _mark_receipt_applied(receipt_path, home=home),
                 )
     finally:
         reset_hermes_home_override(token)

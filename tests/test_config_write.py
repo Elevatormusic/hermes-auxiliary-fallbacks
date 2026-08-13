@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
 import stat
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -73,6 +75,25 @@ def windows_dacl_is_protected(path: Path) -> bool:
     """Return the protected state from one Windows DACL descriptor."""
 
     return windows_dacl_state(path)[0]
+
+
+def windows_security_control(path: Path) -> int:
+    """Return the Windows security descriptor control flags."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32, descriptor = windows_security_descriptor(path)
+    control = wintypes.WORD()
+    revision = wintypes.DWORD()
+    if not advapi32.GetSecurityDescriptorControl(
+        descriptor,
+        ctypes.byref(control),
+        ctypes.byref(revision),
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, "Cannot read the test security control state.", str(path))
+    return int(control.value)
 
 
 def windows_dacl_state(path: Path) -> tuple[bool, bytes]:
@@ -375,6 +396,8 @@ def test_conditional_update_preserves_windows_dacl_protection(tmp_path):
         pytest.skip("The test user cannot set a protected DACL.")
     before_protected, before_dacl = windows_dacl_state(config_path)
     before_owner = windows_owner_sid(config_path)
+    before_control = windows_security_control(config_path)
+    dacl_control_mask = 0x1500
     assert before_protected is True
 
     writer.conditional_roundtrip_yaml_update(
@@ -386,46 +409,118 @@ def test_conditional_update_preserves_windows_dacl_protection(tmp_path):
 
     after_protected, after_dacl = windows_dacl_state(config_path)
     after_owner = windows_owner_sid(config_path)
+    after_control = windows_security_control(config_path)
     assert after_protected is True
     assert after_dacl == before_dacl
     assert after_owner == before_owner
+    assert after_control & dacl_control_mask == before_control & dacl_control_mask
 
 
-def test_conditional_update_handles_windows_unprotected_dacl(tmp_path):
-    """Preserve an unprotected DACL or fail before replacement."""
+def test_conditional_update_handles_windows_unprotected_dacl():
+    """Preserve an unprotected DACL for a normal user-owned file."""
 
     if os.name != "nt":
         pytest.skip("Windows DACL protection is not available.")
     writer = load_writer()
-    config_path = tmp_path / "config.yaml"
-    original = "theme: gold\n"
-    config_path.write_text(original, encoding="utf-8")
-    try:
-        set_windows_dacl_protection(config_path, False)
-    except OSError:
-        pytest.skip("The test user cannot set an unprotected DACL.")
-    before_protected, before_dacl = windows_dacl_state(config_path)
-    before_owner = windows_owner_sid(config_path)
-    assert before_protected is False
+    se_dacl_auto_inherited = 0x0400
+    se_dacl_protected = 0x1000
+    dacl_control_mask = 0x1500
+    test_parent = Path(tempfile.gettempdir()).resolve()
+    while True:
+        parent_control = windows_security_control(test_parent)
+        if (
+            parent_control & se_dacl_auto_inherited
+            and not parent_control & se_dacl_protected
+        ):
+            break
+        if test_parent.parent == test_parent:
+            pytest.skip("No writable auto-inherited test parent is available.")
+        test_parent = test_parent.parent
 
+    test_root = test_parent / f"auxiliary-fallbacks-acl-{uuid.uuid4().hex}"
+    test_root.mkdir()
     try:
+        config_path = test_root / "config.yaml"
+        original = "theme: gold\n"
+        config_path.write_text(original, encoding="utf-8")
+        before_protected, before_dacl = windows_dacl_state(config_path)
+        before_owner = windows_owner_sid(config_path)
+        before_control = windows_security_control(config_path)
+        if before_protected:
+            pytest.skip("The test file does not have an unprotected DACL.")
+        if not before_control & se_dacl_auto_inherited:
+            pytest.skip("The test file does not have an auto-inherited DACL.")
+
         writer.conditional_roundtrip_yaml_update(
             config_path,
             "auxiliary.vision.fallback_chain",
             [],
             writer.config_revision(config_path),
         )
-    except writer.ConfigWriteUnavailable as exc:
-        assert "security metadata" in str(exc)
-        assert config_path.read_text(encoding="utf-8") == original
-        assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
-        return
 
-    after_protected, after_dacl = windows_dacl_state(config_path)
-    after_owner = windows_owner_sid(config_path)
-    assert after_protected is False
-    assert after_dacl == before_dacl
-    assert after_owner == before_owner
+        after_protected, after_dacl = windows_dacl_state(config_path)
+        after_owner = windows_owner_sid(config_path)
+        after_control = windows_security_control(config_path)
+        assert after_protected is False
+        assert after_dacl == before_dacl
+        assert after_owner == before_owner
+        assert after_control & dacl_control_mask == before_control & dacl_control_mask
+    finally:
+        shutil.rmtree(test_root)
+
+
+def test_windows_security_write_flags_use_only_required_fields():
+    """Request only fields that differ and reject DACL control drift."""
+
+    writer = load_writer()
+    owner_security_information = 0x00000001
+    dacl_security_information = 0x00000004
+    protected_dacl_security_information = 0x80000000
+    se_dacl_auto_inherit_req = 0x0100
+    se_dacl_auto_inherited = 0x0400
+    se_dacl_protected = 0x1000
+
+    assert writer._windows_security_write_flags(
+        protected_dacl_security_information,
+        owner_matches=True,
+        dacl_matches=True,
+        source_control=0,
+        destination_control=0,
+    ) == 0
+    assert writer._windows_security_write_flags(
+        protected_dacl_security_information,
+        owner_matches=False,
+        dacl_matches=True,
+        source_control=0,
+        destination_control=0,
+    ) == owner_security_information
+    assert writer._windows_security_write_flags(
+        protected_dacl_security_information,
+        owner_matches=True,
+        dacl_matches=False,
+        source_control=0,
+        destination_control=0,
+    ) == dacl_security_information
+    assert writer._windows_security_write_flags(
+        protected_dacl_security_information,
+        owner_matches=True,
+        dacl_matches=True,
+        source_control=se_dacl_protected,
+        destination_control=0,
+    ) == dacl_security_information | protected_dacl_security_information
+
+    for auto_inherit_mismatch in (
+        se_dacl_auto_inherit_req,
+        se_dacl_auto_inherited,
+    ):
+        with pytest.raises(OSError, match="auto-inheritance"):
+            writer._windows_security_write_flags(
+                protected_dacl_security_information,
+                owner_matches=True,
+                dacl_matches=True,
+                source_control=auto_inherit_mismatch,
+                destination_control=0,
+            )
 
 
 def test_conditional_update_rejects_windows_source_dacl_drift(tmp_path):

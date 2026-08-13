@@ -298,6 +298,8 @@ catch {
                     $Plan.ReceiptPath = Assert-SafePath $Plan.Home $Plan.ReceiptPath
                     & $Python -B (Join-Path $PSScriptRoot "plugin_state.py") rollback --hermes-agent $ResolvedAgent --hermes-home $Plan.Home --receipt $Plan.ReceiptPath
                     if ($LASTEXITCODE -ne 0) { throw "Hermes did not roll back the plugin allow-list." }
+                    $Plan.Home = Assert-NoReparseAncestors $Plan.Home
+                    $Plan.ReceiptPath = Assert-SafePath $Plan.Home $Plan.ReceiptPath
                     Remove-Item -Force -LiteralPath $Plan.ReceiptPath
                 }
                 catch {
@@ -335,7 +337,11 @@ catch {
 
 foreach ($Plan in $Plans) {
     if (Test-Path -LiteralPath $Plan.ReceiptPath -PathType Leaf) {
-        try { Remove-Item -Force -LiteralPath $Plan.ReceiptPath }
+        try {
+            $Plan.Home = Assert-NoReparseAncestors $Plan.Home
+            $Plan.ReceiptPath = Assert-SafePath $Plan.Home $Plan.ReceiptPath
+            Remove-Item -Force -LiteralPath $Plan.ReceiptPath
+        }
         catch { Write-Warning "Could not remove the completed transaction receipt: $($Plan.ReceiptPath)" }
     }
     if ($Plan.Existing.Count -eq 0 -and (Test-Path -LiteralPath $Plan.BackupRoot -PathType Container)) {

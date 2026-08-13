@@ -10,6 +10,7 @@ All notable changes to this project are listed in this file.
 - Add fixed error messages that do not expose configuration values.
 - Reject redirected profile and configuration paths at request and write time.
 - Preserve and verify configuration security metadata, owner identity, protected and unprotected DACL entries, DACL protection state, and source security state during replacement.
+- Keep transaction receipts in the selected Hermes home. Validate each receipt before read, write, replace, or delete.
 - Keep profile target paths lexical so safety checks can detect redirects.
 - Read smoke-test provider settings from the active Hermes profile.
 - Validate direct helper homes and configuration paths before an override or write.

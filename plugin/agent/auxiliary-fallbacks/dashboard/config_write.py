@@ -133,6 +133,40 @@ def config_revision(path: Path) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
+def _windows_security_write_flags(
+    dacl_control: int,
+    *,
+    owner_matches: bool,
+    dacl_matches: bool,
+    source_control: int,
+    destination_control: int,
+) -> int:
+    """Return only the Windows security flags needed for one copy."""
+
+    owner_security_information = 0x00000001
+    dacl_security_information = 0x00000004
+    se_dacl_auto_inherit_req = 0x0100
+    se_dacl_auto_inherited = 0x0400
+    se_dacl_protected = 0x1000
+    auto_inherit_mask = se_dacl_auto_inherit_req | se_dacl_auto_inherited
+    if (source_control & auto_inherit_mask) != (
+        destination_control & auto_inherit_mask
+    ):
+        raise OSError("The replacement DACL auto-inheritance state cannot be copied.")
+
+    protection_matches = bool(source_control & se_dacl_protected) == bool(
+        destination_control & se_dacl_protected
+    )
+    flags = 0
+    if not owner_matches:
+        flags |= owner_security_information
+    if not dacl_matches or not protection_matches:
+        flags |= dacl_security_information
+    if not protection_matches:
+        flags |= dacl_control
+    return flags
+
+
 def _copy_windows_security_descriptor(source: Path, destination: Path) -> Callable[[], None]:
     """Copy the source owner and DACL state to the replacement."""
 
@@ -143,7 +177,12 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> Callab
     dacl_security_information = 0x00000004
     unprotected_dacl_security_information = 0x20000000
     protected_dacl_security_information = 0x80000000
+    se_dacl_auto_inherit_req = 0x0100
+    se_dacl_auto_inherited = 0x0400
     se_dacl_protected = 0x1000
+    dacl_control_mask = (
+        se_dacl_auto_inherit_req | se_dacl_auto_inherited | se_dacl_protected
+    )
     error_insufficient_buffer = 122
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     get_file_security = advapi32.GetFileSecurityW
@@ -275,8 +314,8 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> Callab
             raise OSError(error, "Cannot read the configuration DACL size.", str(path))
         return True, False, ctypes.string_at(dacl, information.AclBytesInUse)
 
-    def dacl_protected(descriptor, path: Path) -> bool:
-        """Return the DACL protection state from a security descriptor."""
+    def dacl_control_state(descriptor, path: Path) -> int:
+        """Return the DACL inheritance and protection control state."""
 
         control = wintypes.WORD()
         revision = wintypes.DWORD()
@@ -287,30 +326,49 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> Callab
         ):
             error = ctypes.get_last_error()
             raise OSError(error, "Cannot read the configuration DACL control state.", str(path))
-        return bool(control.value & se_dacl_protected)
+        return int(control.value) & dacl_control_mask
 
     security_information = owner_security_information | dacl_security_information
     descriptor = read_security_descriptor(source)
     source_owner = owner_sid(descriptor, source)
-    source_protected = dacl_protected(descriptor, source)
+    source_control = dacl_control_state(descriptor, source)
+    source_protected = bool(source_control & se_dacl_protected)
     source_dacl = dacl_state(descriptor, source)
-    dacl_control = (
+    destination_descriptor = read_security_descriptor(destination)
+    destination_owner_matches = bool(
+        equal_sid(source_owner, owner_sid(destination_descriptor, destination))
+    )
+    destination_control = dacl_control_state(destination_descriptor, destination)
+    destination_dacl = dacl_state(destination_descriptor, destination)
+    desired_dacl_control = (
         protected_dacl_security_information
         if source_protected
         else unprotected_dacl_security_information
     )
-    if not set_file_security(
-        str(destination),
-        security_information | dacl_control,
-        descriptor,
-    ):
-        error = ctypes.get_last_error()
-        raise OSError(error, "Cannot set the replacement security descriptor.", str(destination))
+    write_flags = _windows_security_write_flags(
+        desired_dacl_control,
+        owner_matches=destination_owner_matches,
+        dacl_matches=destination_dacl == source_dacl,
+        source_control=source_control,
+        destination_control=destination_control,
+    )
+    if write_flags:
+        if not set_file_security(
+            str(destination),
+            write_flags,
+            descriptor,
+        ):
+            error = ctypes.get_last_error()
+            raise OSError(
+                error,
+                "Cannot set the replacement security descriptor.",
+                str(destination),
+            )
     replacement_descriptor = read_security_descriptor(destination)
     if not equal_sid(source_owner, owner_sid(replacement_descriptor, destination)):
         raise OSError("The replacement configuration owner does not match the source.")
-    if source_protected != dacl_protected(replacement_descriptor, destination):
-        raise OSError("The replacement configuration DACL protection does not match the source.")
+    if source_control != dacl_control_state(replacement_descriptor, destination):
+        raise OSError("The replacement configuration DACL control does not match the source.")
     if source_dacl != dacl_state(replacement_descriptor, destination):
         raise OSError("The replacement configuration DACL does not match the source.")
 
@@ -322,8 +380,8 @@ def _copy_windows_security_descriptor(source: Path, destination: Path) -> Callab
         # while the ctypes descriptor buffer exists.
         if not equal_sid(owner_sid(descriptor, source), owner_sid(current_descriptor, source)):
             raise OSError("The configuration owner changed during the write.")
-        if source_protected != dacl_protected(current_descriptor, source):
-            raise OSError("The configuration DACL protection changed during the write.")
+        if source_control != dacl_control_state(current_descriptor, source):
+            raise OSError("The configuration DACL control changed during the write.")
         if source_dacl != dacl_state(current_descriptor, source):
             raise OSError("The configuration DACL changed during the write.")
 
