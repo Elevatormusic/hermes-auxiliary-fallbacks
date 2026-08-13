@@ -1,0 +1,75 @@
+name: Install or fallback failure
+description: Report an install, profile, model-catalog, or role-fallback problem.
+title: "[Problem]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include API keys, tokens, private host names, or sensitive images.
+  - type: input
+    id: hermes-version
+    attributes:
+      label: Hermes Agent version
+      placeholder: "0.20.0"
+    validations:
+      required: true
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Auxiliary Fallbacks version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: operation
+    attributes:
+      label: Operation
+      options:
+        - Install
+        - Uninstall
+        - Open the Desktop page
+        - Load the provider catalog
+        - Save a fallback chain
+        - Run a fallback
+        - Run the Vision smoke test
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Profile selection
+      description: Use default, a named profile, all profiles, or a redacted custom path.
+    validations:
+      required: true
+  - type: input
+    id: role
+    attributes:
+      label: Auxiliary role
+      placeholder: "Vision"
+  - type: input
+    id: provider-type
+    attributes:
+      label: Provider type
+      description: Give only the provider type, such as OAuth, LM Studio, or OpenAI-compatible.
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result and redacted diagnostics
+      description: Remove credentials, personal paths, private hosts, and sensitive image data.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials and sensitive data from this report.
+          required: true

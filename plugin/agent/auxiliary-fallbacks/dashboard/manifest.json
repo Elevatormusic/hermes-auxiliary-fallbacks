@@ -1,0 +1,12 @@
+{
+  "name": "auxiliary-fallbacks",
+  "label": "Auxiliary Fallbacks",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/auxiliary-fallbacks",
+    "position": "end",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

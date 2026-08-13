@@ -1,0 +1,38 @@
+# Security
+
+## Report a vulnerability
+
+Use GitHub private vulnerability reporting for this repository. Do not put credentials, access tokens, private host names, or sensitive images in a public issue.
+
+## Source boundary
+
+This project must not change the Hermes Agent source tree or Electron application files. It installs two standalone plugin folders under a selected Hermes data home:
+
+```text
+<HERMES_HOME>/plugins/auxiliary-fallbacks/
+<HERMES_HOME>/desktop-plugins/auxiliary-fallbacks/
+```
+
+The installer rejects a Hermes home that is equal to or inside the Hermes Agent source directory.
+
+## Script effects
+
+| File | Local writes | Network use |
+|---|---|---|
+| `scripts/install.ps1` | Copies the two plugin folders, updates the Hermes plugin allow-list, and makes dated backups. It restores the prior state if an operation fails. | None, unless `-RestartGateway` starts a configured Hermes gateway that uses the network. |
+| `scripts/uninstall.ps1` | Moves the two plugin folders to a dated backup and updates the plugin allow-list. It does not remove saved fallback chains. | None, unless `-RestartGateway` starts a configured Hermes gateway that uses the network. |
+| `scripts/plugin_state.py` | Changes only the Hermes plugin allow-list for the selected profile. | None. |
+| `scripts/profile_targets.py` | No writes. It resolves existing Hermes profile paths. | None. |
+| `scripts/vision_fallback_smoke.py` | Creates one UUID-named temporary profile. It removes that profile after a clean test and preserves it if protected data changes. | Sends the selected image to the configured fallback provider. This action can use quota or incur cost. |
+
+## Credential handling
+
+- The Desktop page receives a redacted provider catalog.
+- The plugin does not create another credential store.
+- The plugin uses provider setup that already exists in Hermes.
+- The Vision smoke test does not copy provider credentials into its temporary profile. Registered OAuth providers can use the existing Hermes authentication flow.
+- Do not use the live Vision test with a sensitive image.
+
+## Update safety
+
+Hermes updates can change plugin APIs. Version 1.0.0 is tested with Hermes Agent 0.20.0 on Windows. The backend checks the public Hermes version before it writes a fallback chain. A future Hermes version can still need a plugin update if its public extension contract changes.
