@@ -21,12 +21,44 @@ class ConfigWriteUnavailable(RuntimeError):
     """Report that the required YAML write support is not available."""
 
 
+def _absolute_lexical_path(path: Path) -> Path:
+    """Return an absolute path without following redirects."""
+
+    try:
+        return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ConfigWriteUnavailable("The configuration path is not valid.") from exc
+
+
+def _path_has_redirect(path: Path) -> bool:
+    """Return true when a path or existing ancestor is redirected."""
+
+    for candidate in reversed((path, *path.parents)):
+        try:
+            path_stat = os.lstat(candidate)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ConfigWriteUnavailable("The configuration path cannot be inspected.") from exc
+        if stat.S_ISLNK(path_stat.st_mode):
+            return True
+        attributes = getattr(path_stat, "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if attributes & reparse_flag:
+            return True
+    return False
+
+
 @contextmanager
 def config_file_lock(path: Path, timeout_seconds: float = 10.0) -> Iterator[None]:
     """Serialize this plugin's writes for one Hermes configuration file."""
 
-    lock_path = Path(path).with_name(f".{Path(path).name}.auxiliary-fallbacks.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    target = _absolute_lexical_path(Path(path))
+    lock_path = target.with_name(f".{target.name}.auxiliary-fallbacks.lock")
+    if _path_has_redirect(target) or _path_has_redirect(lock_path):
+        raise ConfigWriteUnavailable("The configuration path is redirected.")
+    if not lock_path.parent.is_dir():
+        raise ConfigWriteUnavailable("The configuration directory is not available.")
     deadline = time.monotonic() + timeout_seconds
 
     if os.name == "nt":
@@ -50,6 +82,10 @@ def config_file_lock(path: Path, timeout_seconds: float = 10.0) -> Iterator[None
                         ) from exc
                     time.sleep(0.05)
             try:
+                if _path_has_redirect(target) or _path_has_redirect(lock_path):
+                    raise ConfigWriteUnavailable(
+                        "The configuration path changed while the lock was held."
+                    )
                 yield
             finally:
                 handle.seek(0)
@@ -77,6 +113,10 @@ def config_file_lock(path: Path, timeout_seconds: float = 10.0) -> Iterator[None
                     ) from exc
                 time.sleep(0.05)
         try:
+            if _path_has_redirect(target) or _path_has_redirect(lock_path):
+                raise ConfigWriteUnavailable(
+                    "The configuration path changed while the lock was held."
+                )
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -117,16 +157,9 @@ def conditional_roundtrip_yaml_update(
             "The required Hermes YAML write API is not available."
         ) from exc
 
-    logical_target = Path(path)
-    try:
-        target_was_symlink = logical_target.is_symlink()
-        target = (
-            logical_target.resolve(strict=False)
-            if target_was_symlink
-            else logical_target
-        )
-    except (OSError, RuntimeError) as exc:
-        raise ConfigWriteUnavailable("The configuration path cannot be resolved.") from exc
+    target = _absolute_lexical_path(Path(path))
+    if _path_has_redirect(target):
+        raise ConfigWriteUnavailable("The configuration path is redirected.")
     keys = key_path.split(".")
     if not keys or any(not key for key in keys):
         raise ValueError("The configuration key path is not valid.")
@@ -187,7 +220,8 @@ def conditional_roundtrip_yaml_update(
     except OSError as exc:
         raise ConfigWriteUnavailable("The configuration metadata cannot be read.") from exc
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.parent.is_dir():
+        raise ConfigWriteUnavailable("The configuration directory is not available.")
     file_descriptor, temporary_name = tempfile.mkstemp(
         dir=str(target.parent),
         prefix=f".{target.stem}_auxiliary_fallbacks_",
@@ -206,20 +240,11 @@ def conditional_roundtrip_yaml_update(
         # Keep this check next to the replace. It is the conditional commit
         # boundary for another Hermes process that writes the same profile.
         try:
-            if target_was_symlink:
-                if (
-                    not logical_target.is_symlink()
-                    or logical_target.resolve(strict=False) != target
-                ):
-                    raise ConfigConflict(
-                        "The configuration link changed during the write."
-                    )
-            elif logical_target.is_symlink():
-                raise ConfigConflict("The configuration path changed during the write.")
-        except (OSError, RuntimeError) as exc:
-            raise ConfigConflict(
-                "The configuration path changed during the write."
-            ) from exc
+            redirected = _path_has_redirect(target)
+        except ConfigWriteUnavailable as exc:
+            raise ConfigConflict("The configuration path changed during the write.") from exc
+        if redirected:
+            raise ConfigConflict("The configuration path changed during the write.")
         if config_revision(target) != expected_revision:
             raise ConfigConflict("The configuration changed during the write.")
         try:

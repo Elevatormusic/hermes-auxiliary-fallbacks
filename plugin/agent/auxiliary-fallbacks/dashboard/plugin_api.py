@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import os
+import stat
 import sys
 import threading
 from collections.abc import Mapping
@@ -69,6 +71,95 @@ def _http_error(status_code: int, message: str) -> HTTPException:
     return HTTPException(status_code=status_code, detail=message)
 
 
+def _absolute_lexical_path(path: Path) -> Path:
+    """Return an absolute path without following redirects."""
+
+    try:
+        return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+    except (OSError, TypeError, ValueError) as exc:
+        raise _http_error(503, "Hermes returned an invalid profile path.") from exc
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Return true for a symlink, junction, or other reparse point."""
+
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise _http_error(503, "Hermes cannot inspect the profile path.") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+    attributes = getattr(path_stat, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_flag)
+
+
+def _reject_reparse_ancestors(path: Path) -> None:
+    """Reject redirects in one path and its existing ancestors."""
+
+    chain = (path, *path.parents)
+    for candidate in reversed(chain):
+        if _is_reparse_point(candidate):
+            raise _http_error(
+                403,
+                "The selected Hermes profile uses a redirected path.",
+            )
+
+
+def _find_hermes_source_root(path: Path) -> Path | None:
+    """Find a Hermes Agent source root at or above one path."""
+
+    current = path if path.is_dir() else path.parent
+    while True:
+        try:
+            is_source = (
+                (current / "hermes_cli" / "config.py").is_file()
+                and (current / "hermes_constants.py").is_file()
+                and (current / "pyproject.toml").is_file()
+            )
+        except OSError as exc:
+            raise _http_error(503, "Hermes cannot inspect the profile path.") from exc
+        if is_source:
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _validate_profile_home(path: Path) -> Path:
+    """Return one profile home that cannot redirect into source code."""
+
+    home = _absolute_lexical_path(path)
+    _reject_reparse_ancestors(home)
+    if not home.is_dir():
+        raise _http_error(503, "The selected Hermes profile home is not available.")
+    if _find_hermes_source_root(home) is not None:
+        raise _http_error(
+            403,
+            "The selected Hermes profile is inside a Hermes Agent source directory.",
+        )
+    return home
+
+
+def _validate_config_target(home: Path, path: Path) -> Path:
+    """Return one configuration target inside the safe profile home."""
+
+    config_path = _absolute_lexical_path(path)
+    expected = _absolute_lexical_path(home / "config.yaml")
+    if os.path.normcase(os.fspath(config_path)) != os.path.normcase(os.fspath(expected)):
+        raise _http_error(403, "Hermes returned an unexpected configuration path.")
+    _reject_reparse_ancestors(config_path)
+    if _find_hermes_source_root(config_path.parent) is not None:
+        raise _http_error(
+            403,
+            "The Hermes configuration is inside a Hermes Agent source directory.",
+        )
+    return config_path
+
+
 @contextmanager
 def _config_transaction() -> Iterator[None]:
     """Hold the plugin write lock for one request."""
@@ -99,7 +190,7 @@ def _profile_scope(requested_profile: str | None) -> Iterator[tuple[str, Path]]:
     if not profile_exists(profile):
         raise _http_error(404, f"Profile '{profile}' does not exist.")
 
-    home = Path(get_profile_dir(profile))
+    home = _validate_profile_home(Path(get_profile_dir(profile)))
     token = set_hermes_home_override(home)
     try:
         yield profile, home
@@ -452,8 +543,9 @@ def get_state(profile: str | None = "default") -> dict[str, Any]:
     from hermes_cli.config import get_config_path
 
     with _config_transaction():
-        with _profile_scope(profile) as (selected_profile, _home):
-            return _load_state_locked(selected_profile, Path(get_config_path()))
+        with _profile_scope(profile) as (selected_profile, home):
+            config_path = _validate_config_target(home, Path(get_config_path()))
+            return _load_state_locked(selected_profile, config_path)
 
 
 def _validate_chain_body(
@@ -556,8 +648,8 @@ def put_chain(
     from hermes_cli.managed_scope import is_key_managed
 
     with _config_transaction():
-        with _profile_scope(profile) as (selected_profile, _home):
-            config_path = Path(get_config_path())
+        with _profile_scope(profile) as (selected_profile, home):
+            config_path = _validate_config_target(home, Path(get_config_path()))
             if not isinstance(payload, Mapping):
                 raise _http_error(422, "The request body must be an object.")
             if is_managed():
@@ -631,9 +723,13 @@ def put_chain(
             else:
                 raw_task["fallback_chain"] = []
 
+            _validate_profile_home(home)
+            config_path = _validate_config_target(home, config_path)
             writer, file_lock, conflict_error, unavailable_error = _config_write_support()
             try:
                 with file_lock(config_path):
+                    _validate_profile_home(home)
+                    config_path = _validate_config_target(home, config_path)
                     writer(
                         config_path,
                         f"auxiliary.{task}.fallback_chain",

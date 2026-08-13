@@ -196,6 +196,7 @@ The temporary-profile test is designed for registered and OAuth providers such a
 - The backend rejects duplicate entries and a fallback that equals the explicit primary route.
 - Existing route metadata stays in the configuration only when the provider and model pair stays the same.
 - API keys and other secret fields are never returned by the extension API.
+- Every request rejects a profile home or `config.yaml` path that uses a symlink, junction, or other reparse point. It also rejects a profile inside a Hermes Agent source tree.
 
 See [SECURITY.md](SECURITY.md) for the full write boundary, rollback behavior, network effects, and vulnerability-reporting guidance.
 
@@ -203,7 +204,7 @@ See [SECURITY.md](SECURITY.md) for the full write boundary, rollback behavior, n
 
 Version 1.0.1 was verified with a current Hermes Agent 0.20.0 build on Windows:
 
-- 52 focused Python tests passed. One POSIX-only symlink test was skipped on Windows and runs in Ubuntu CI.
+- 63 focused Python tests passed. Two POSIX-only redirect tests were skipped on Windows and run in Ubuntu CI.
 - Python compile, Desktop plugin syntax, and Windows PowerShell 5.1 parser checks passed.
 - Install and removal scripts rejected Hermes source-tree targets.
 - The installed backend returned all eight standard roles and only configured provider catalog entries.

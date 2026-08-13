@@ -133,7 +133,34 @@ def test_commit_callback_precedes_post_write_conflict_check(tmp_path):
     assert config_path.read_text(encoding="utf-8") == "theme: external\n"
 
 
-def test_conditional_update_preserves_a_configuration_symlink(tmp_path):
+def test_redirect_introduced_before_replace_is_rejected(tmp_path, monkeypatch):
+    writer = load_writer()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("theme: old\n", encoding="utf-8")
+    redirected = False
+
+    def path_has_redirect(_path):
+        return redirected
+
+    def introduce_redirect(_candidate_revision):
+        nonlocal redirected
+        redirected = True
+
+    monkeypatch.setattr(writer, "_path_has_redirect", path_has_redirect)
+    with pytest.raises(writer.ConfigConflict):
+        writer.conditional_roundtrip_yaml_update(
+            config_path,
+            "auxiliary.vision.fallback_chain",
+            [],
+            writer.config_revision(config_path),
+            before_replace=introduce_redirect,
+        )
+
+    assert config_path.read_text(encoding="utf-8") == "theme: old\n"
+    assert list(tmp_path.glob(".config_auxiliary_fallbacks_*.tmp")) == []
+
+
+def test_conditional_update_rejects_a_configuration_symlink(tmp_path):
     if os.name == "nt":
         pytest.skip("Windows test users do not always have symlink permission.")
     writer = load_writer()
@@ -142,15 +169,16 @@ def test_conditional_update_preserves_a_configuration_symlink(tmp_path):
     real_path.write_text("theme: gold\n", encoding="utf-8")
     link_path.symlink_to(real_path)
 
-    writer.conditional_roundtrip_yaml_update(
-        link_path,
-        "auxiliary.vision.fallback_chain",
-        [],
-        writer.config_revision(link_path),
-    )
+    with pytest.raises(writer.ConfigWriteUnavailable):
+        writer.conditional_roundtrip_yaml_update(
+            link_path,
+            "auxiliary.vision.fallback_chain",
+            [],
+            writer.config_revision(link_path),
+        )
 
     assert link_path.is_symlink()
-    assert yaml.safe_load(real_path.read_text(encoding="utf-8"))["theme"] == "gold"
+    assert real_path.read_text(encoding="utf-8") == "theme: gold\n"
 
 
 def test_config_file_lock_rejects_a_second_writer(tmp_path):
@@ -161,3 +189,18 @@ def test_config_file_lock_rejects_a_second_writer(tmp_path):
         with pytest.raises(writer.ConfigConflict):
             with writer.config_file_lock(config_path, timeout_seconds=0.0):
                 pytest.fail("The second writer acquired the same plugin lock.")
+
+
+def test_config_file_lock_rejects_redirect_before_sidecar_write(
+    tmp_path,
+    monkeypatch,
+):
+    writer = load_writer()
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(writer, "_path_has_redirect", lambda _path: True)
+
+    with pytest.raises(writer.ConfigWriteUnavailable):
+        with writer.config_file_lock(config_path):
+            pytest.fail("The redirected lock path was accepted.")
+
+    assert not (tmp_path / ".config.yaml.auxiliary-fallbacks.lock").exists()

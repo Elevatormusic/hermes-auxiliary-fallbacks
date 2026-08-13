@@ -8,6 +8,7 @@ All notable changes to this project are listed in this file.
 - Add durable receipt states for interrupted install and removal recovery.
 - Keep unrelated settings when a concurrent write can be detected.
 - Add fixed error messages that do not expose configuration values.
+- Reject redirected profile and configuration paths at request and write time.
 
 ## 1.0.0 - 2026-08-13
 

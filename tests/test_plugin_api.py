@@ -6,6 +6,8 @@ import copy
 import hashlib
 import importlib.util
 import os
+import stat
+import subprocess
 import sys
 import types
 import uuid
@@ -86,6 +88,7 @@ def api_runtime(tmp_path, monkeypatch):
         current_home=default_home,
         default_home=default_home,
         work_home=work_home,
+        profile_dirs={"default": default_home, "work": work_home},
         configs={
             default_home: {"auxiliary": copy.deepcopy(standard), "root": "default"},
             work_home: work_config,
@@ -100,6 +103,11 @@ def api_runtime(tmp_path, monkeypatch):
         change_before_save=False,
         change_revision_during_load=False,
         change_revision_during_catalog=False,
+        config_path_override=None,
+        override_calls=0,
+        redirect_during_catalog=False,
+        redirect_on_lock=False,
+        redirected=False,
     )
 
     def normalize_profile_name(name):
@@ -116,18 +124,19 @@ def api_runtime(tmp_path, monkeypatch):
         return name in {"default", "work"}
 
     def get_profile_dir(name):
-        return default_home if name == "default" else default_home / "profiles" / name
+        return runtime.profile_dirs[name]
 
     def set_home_override(path):
         old = runtime.current_home
         runtime.current_home = Path(path)
+        runtime.override_calls += 1
         return old
 
     def reset_home_override(token):
         runtime.current_home = token
 
     def get_config_path():
-        return runtime.current_home / "config.yaml"
+        return runtime.config_path_override or runtime.current_home / "config.yaml"
 
     def load_config():
         return copy.deepcopy(runtime.configs[runtime.current_home])
@@ -209,6 +218,9 @@ def api_runtime(tmp_path, monkeypatch):
 
     def build_aux_picker_rows():
         runtime.catalog_calls.append(True)
+        if runtime.redirect_during_catalog:
+            runtime.redirect_during_catalog = False
+            runtime.redirected = True
         if runtime.change_revision_during_catalog:
             runtime.change_revision_during_catalog = False
             (runtime.current_home / "config.yaml").write_text(
@@ -287,6 +299,9 @@ def api_runtime(tmp_path, monkeypatch):
 
     @contextmanager
     def config_file_lock(_path):
+        if runtime.redirect_on_lock:
+            runtime.redirect_on_lock = False
+            runtime.redirected = True
         yield
 
     def conditional_writer(
@@ -423,6 +438,139 @@ def test_get_state_fails_closed_without_uncached_raw_reader(api_runtime):
     assert runtime.current_home == runtime.default_home
 
 
+def test_get_rejects_redirected_profile_before_override(api_runtime, monkeypatch):
+    api, runtime, _hermes_cli = api_runtime
+    original = api._is_reparse_point
+    monkeypatch.setattr(
+        api,
+        "_is_reparse_point",
+        lambda path: Path(path) == runtime.work_home or original(path),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        api.get_state("work")
+
+    assert caught.value.status_code == 403
+    assert runtime.override_calls == 0
+    assert runtime.raw_read_paths == []
+    assert runtime.write_calls == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="This test uses a POSIX symlink.")
+def test_get_rejects_posix_profile_symlink(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    target = runtime.default_home.parent / "redirect-target"
+    target.mkdir()
+    (target / "config.yaml").write_text("work", encoding="utf-8")
+    link = runtime.default_home / "profiles" / "redirected-work"
+    link.symlink_to(target, target_is_directory=True)
+    runtime.profile_dirs["work"] = link
+
+    with pytest.raises(HTTPException) as caught:
+        api.get_state("work")
+
+    assert caught.value.status_code == 403
+    assert runtime.override_calls == 0
+    assert runtime.raw_read_paths == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="This test uses a Windows junction.")
+def test_get_rejects_windows_profile_junction(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    target = runtime.default_home.parent / "junction-target"
+    target.mkdir()
+    (target / "config.yaml").write_text("work", encoding="utf-8")
+    junction = runtime.default_home / "profiles" / "junction-work"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("The test user cannot create a Windows junction.")
+    runtime.profile_dirs["work"] = junction
+    try:
+        with pytest.raises(HTTPException) as caught:
+            api.get_state("work")
+
+        assert caught.value.status_code == 403
+        assert runtime.override_calls == 0
+        assert runtime.raw_read_paths == []
+    finally:
+        os.rmdir(junction)
+
+
+def test_get_rejects_profile_inside_hermes_source(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    source = runtime.default_home.parent / "other-hermes-agent"
+    profile = source / "profiles" / "work"
+    (source / "hermes_cli").mkdir(parents=True)
+    (source / "hermes_cli" / "config.py").write_text("", encoding="utf-8")
+    (source / "hermes_constants.py").write_text("", encoding="utf-8")
+    (source / "pyproject.toml").write_text("", encoding="utf-8")
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("work", encoding="utf-8")
+    runtime.profile_dirs["work"] = profile
+    runtime.configs[profile] = copy.deepcopy(runtime.configs[runtime.work_home])
+
+    with pytest.raises(HTTPException) as caught:
+        api.get_state("work")
+
+    assert caught.value.status_code == 403
+    assert runtime.override_calls == 0
+    assert runtime.raw_read_paths == []
+
+
+@pytest.mark.parametrize("relative_path", ["other.yaml", "nested/config.yaml"])
+def test_get_requires_exact_profile_config_path(api_runtime, relative_path):
+    api, runtime, _hermes_cli = api_runtime
+    runtime.config_path_override = runtime.work_home / relative_path
+
+    with pytest.raises(HTTPException) as caught:
+        api.get_state("work")
+
+    assert caught.value.status_code == 403
+    assert "unexpected configuration path" in str(caught.value.detail)
+    assert runtime.raw_read_paths == []
+    assert runtime.current_home == runtime.default_home
+
+
+def test_get_rejects_redirected_config_target(api_runtime, monkeypatch):
+    api, runtime, _hermes_cli = api_runtime
+    config_path = runtime.work_home / "config.yaml"
+    original = api._is_reparse_point
+    monkeypatch.setattr(
+        api,
+        "_is_reparse_point",
+        lambda path: Path(path) == config_path or original(path),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        api.get_state("work")
+
+    assert caught.value.status_code == 403
+    assert runtime.raw_read_paths == []
+    assert runtime.write_calls == []
+
+
+def test_reparse_attribute_is_detected_without_symlink_mode(
+    api_runtime,
+    monkeypatch,
+):
+    api, _runtime, _hermes_cli = api_runtime
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    fake_stat = types.SimpleNamespace(
+        st_mode=stat.S_IFDIR,
+        st_file_attributes=reparse_flag,
+    )
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(api.stat, "FILE_ATTRIBUTE_REPARSE_POINT", reparse_flag, raising=False)
+        scoped.setattr(api.os, "lstat", lambda _path: fake_stat)
+        assert api._is_reparse_point(Path("junction")) is True
+
+
 def test_put_reorders_and_preserves_exact_pair_metadata(api_runtime):
     api, runtime, _hermes_cli = api_runtime
     before = api.get_state("work")
@@ -479,6 +627,43 @@ def test_put_rejects_change_made_before_conditional_commit(api_runtime):
     assert saved["during_save"] == "keep"
     assert saved["auxiliary"]["vision"]["fallback_chain"][0]["model"] == "qwen-vl-4b"
     assert runtime.write_calls == []
+
+
+@pytest.mark.parametrize("redirect_phase", ["catalog", "lock"])
+def test_put_rejects_redirect_introduced_before_write(
+    api_runtime,
+    monkeypatch,
+    redirect_phase,
+):
+    api, runtime, _hermes_cli = api_runtime
+    before = api.get_state("work")
+    original = api._is_reparse_point
+    monkeypatch.setattr(
+        api,
+        "_is_reparse_point",
+        lambda path: (
+            runtime.redirected and Path(path) == runtime.work_home
+        )
+        or original(path),
+    )
+    if redirect_phase == "catalog":
+        runtime.redirect_during_catalog = True
+    else:
+        runtime.redirect_on_lock = True
+
+    with pytest.raises(HTTPException) as caught:
+        api.put_chain(
+            "vision",
+            {
+                "revision": before["revision"],
+                "chain": [{"provider": "lmstudio", "model": "qwen-vl-7b"}],
+            },
+            "work",
+        )
+
+    assert caught.value.status_code == 403
+    assert runtime.write_calls == []
+    assert runtime.current_home == runtime.default_home
 
 
 def test_put_accepts_configured_provider_with_exhausted_pool(api_runtime):
