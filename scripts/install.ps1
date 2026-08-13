@@ -200,7 +200,6 @@ foreach ($SelectedProfile in $SelectedProfiles) {
         AgentCopyAttempted = $false
         DesktopCopyAttempted = $false
         ConfigMutationAttempted = $false
-        ConfigMutationCompleted = $false
         RestartAttempted = $false
     }
 }
@@ -241,7 +240,6 @@ try {
         & $Python -B (Join-Path $PSScriptRoot "plugin_state.py") enable --hermes-agent $ResolvedAgent --hermes-home $Plan.Home --receipt $Plan.ReceiptPath
         $PluginStateExitCode = $LASTEXITCODE
         if ($PluginStateExitCode -ne 0) { throw "Hermes did not enable the backend plugin for $($Plan.Name)." }
-        $Plan.ConfigMutationCompleted = $true
     }
 
     if ($RestartGateway) {
@@ -291,7 +289,7 @@ catch {
             }
             catch { $RollbackErrors.Add("Could not restore the $($Item.Name) plugin for $($Plan.Name): $($_.Exception.Message)") }
         }
-        if ($Plan.ConfigMutationCompleted) {
+        if ($Plan.ConfigMutationAttempted) {
             if (Test-Path -LiteralPath $Plan.ReceiptPath -PathType Leaf) {
                 try {
                     $Plan.ConfigPath = Assert-SafePath $Plan.Home $Plan.ConfigPath
@@ -307,9 +305,6 @@ catch {
             else {
                 $RollbackErrors.Add("No transaction receipt was available for $($Plan.Name). No plugin allow-list rollback was attempted.")
             }
-        }
-        elseif ($Plan.ConfigMutationAttempted) {
-            $RollbackErrors.Add("The plugin allow-list helper did not complete for $($Plan.Name). The current configuration was preserved. Receipt: $($Plan.ReceiptPath)")
         }
         if ($Plan.RestartAttempted) {
             try { Invoke-GatewayRestart $Hermes $Plan.Home }

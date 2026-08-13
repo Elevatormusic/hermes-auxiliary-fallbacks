@@ -19,7 +19,7 @@ For example, a local text-only model can stay as the main chat model. Vision can
 
 ## ⚡ Quick start
 
-Hermes Auxiliary Fallbacks is tested on Windows with Hermes Agent 0.20.0.
+Hermes Auxiliary Fallbacks is tested on Windows with the current Hermes Agent 0.20.0 configuration API.
 
 ```powershell
 git clone https://github.com/Elevatormusic/hermes-auxiliary-fallbacks.git
@@ -64,12 +64,12 @@ Hermes tries a role chain before its general safety routes. Hermes 0.20 can stil
 | Standalone plugin files | Usually stay in the Hermes data home. Run the installer again if an update removes them. |
 | Hermes source and Electron files | Never changed by this project. |
 
-Hermes can change its plugin contract in a future release. Version 1.0.0 is verified with Hermes Agent 0.20.0. The backend blocks writes on older versions and reports a clear compatibility error. A newer Hermes version can still need a plugin update.
+Hermes can change its plugin contract in a future release. Version 1.0.0 is verified with a Hermes Agent 0.20.0 build that provides `read_user_config_raw`. The backend blocks writes on older or incompatible builds and reports a clear compatibility error. A newer Hermes version can still need a plugin update.
 
 ## Requirements
 
 - Windows PowerShell 5.1 or newer for the included install and removal scripts.
-- Hermes Agent 0.20.0 or a newer compatible version that provides the Desktop Plugin SDK, auxiliary role fallback chains, and dashboard plugin API routes.
+- Hermes Agent 0.20.0 or a newer compatible version that provides the current uncached read, auxiliary picker, exact-key write, Desktop Plugin SDK, auxiliary fallback-chain, and dashboard route APIs.
 - Hermes Desktop for the graphical page.
 - A vision-capable model for each Vision fallback. A text-only Qwen model cannot analyze images; use Qwen-VL or another vision model.
 
@@ -99,7 +99,7 @@ Use `-HermesHome` only for a custom Hermes home that is not a standard named pro
 .\scripts\install.ps1 -HermesHome "D:\HermesData"
 ```
 
-`-HermesHome`, `-Profile`, and `-AllProfiles` are mutually exclusive. The scripts use the installed Hermes profile API to validate named profiles. An all-profile install uses one rollback boundary. If one profile fails, rollback changes only this plugin's allow-list membership in the latest configuration. It keeps unrelated current settings. If the same membership changed during the operation, rollback stops and keeps the current configuration and its recovery receipt. Failed copied plugin folders move to the dated backup instead of being deleted.
+`-HermesHome`, `-Profile`, and `-AllProfiles` are mutually exclusive. The scripts use the installed Hermes profile API to validate named profiles. An all-profile install uses one rollback boundary. If one profile fails, rollback changes only this plugin's allow-list membership in the latest configuration. It keeps unrelated current settings. Rollback stops when the membership differs from the expected transaction states. Do not edit this plugin's allow-list while installation or removal is in progress. Failed copied plugin folders move to the dated backup instead of being deleted.
 
 The installer copies files to these Hermes data folders:
 
@@ -201,9 +201,9 @@ See [SECURITY.md](SECURITY.md) for the full write boundary, rollback behavior, n
 
 ## Verification
 
-Version 1.0.0 was verified with Hermes Agent 0.20.0 on Windows:
+Version 1.0.0 was verified with a current Hermes Agent 0.20.0 build on Windows:
 
-- 32 focused Python tests passed.
+- 42 focused Python tests passed.
 - Python compile, Desktop plugin syntax, and Windows PowerShell 5.1 parser checks passed.
 - Install and removal scripts rejected Hermes source-tree targets.
 - The installed backend returned all eight standard roles and only configured provider catalog entries.

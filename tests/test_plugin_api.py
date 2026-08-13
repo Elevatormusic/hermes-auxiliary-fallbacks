@@ -88,11 +88,15 @@ def api_runtime(tmp_path, monkeypatch):
             default_home: {"auxiliary": copy.deepcopy(standard), "root": "default"},
             work_home: work_config,
         },
-        save_calls=[],
+        write_calls=[],
         catalog_calls=[],
+        raw_read_paths=[],
+        raw_read_error=None,
         save_number=0,
         managed=False,
         managed_keys=set(),
+        change_before_save=False,
+        change_revision_during_load=False,
         change_revision_during_catalog=False,
     )
 
@@ -126,18 +130,41 @@ def api_runtime(tmp_path, monkeypatch):
     def load_config():
         return copy.deepcopy(runtime.configs[runtime.current_home])
 
-    def save_config(config, *, preserve_keys=None, **_kwargs):
-        runtime.configs[runtime.current_home] = copy.deepcopy(config)
-        runtime.save_calls.append(
-            {
-                "home": runtime.current_home,
-                "config": copy.deepcopy(config),
-                "preserve_keys": preserve_keys,
-            }
+    def read_user_config_raw(config_path=None):
+        path = Path(config_path) if config_path is not None else get_config_path()
+        runtime.raw_read_paths.append(path)
+        if runtime.raw_read_error is not None:
+            raise runtime.raw_read_error
+        home = path.parent
+        snapshot = copy.deepcopy(runtime.configs[home])
+        if runtime.change_revision_during_load:
+            runtime.change_revision_during_load = False
+            runtime.configs[home]["concurrent"] = "keep"
+            runtime.configs[home]["auxiliary"]["vision"][
+                "fallback_chain"
+            ] = [{"provider": "lmstudio", "model": "qwen-vl-7b"}]
+            path.write_text(
+                "changed after the old configuration loaded",
+                encoding="utf-8",
+            )
+        return snapshot
+
+    def atomic_roundtrip_yaml_update(path, key_path, value):
+        if runtime.change_before_save:
+            runtime.change_before_save = False
+            runtime.configs[Path(path).parent]["during_save"] = "keep"
+        target = runtime.configs[Path(path).parent]
+        current = target
+        keys = key_path.split(".")
+        for key in keys[:-1]:
+            current = current.setdefault(key, {})
+        current[keys[-1]] = copy.deepcopy(value)
+        runtime.write_calls.append(
+            {"path": Path(path), "key": key_path, "value": copy.deepcopy(value)}
         )
         runtime.save_number += 1
         marker = "saved-" + str(runtime.save_number) + ("x" * runtime.save_number)
-        get_config_path().write_text(marker, encoding="utf-8")
+        Path(path).write_text(marker, encoding="utf-8")
 
     catalog_payload = {
         "providers": [
@@ -162,6 +189,13 @@ def api_runtime(tmp_path, monkeypatch):
                 "password": "catalog-password",
             },
             {
+                "slug": "openai-codex",
+                "name": "OpenAI Codex",
+                "models": ["gpt-5.6-terra"],
+                "authenticated": True,
+                "credential_pool_exhausted": True,
+            },
+            {
                 "slug": "moa",
                 "models": ["virtual"],
                 "api_key": "moa-secret",
@@ -171,18 +205,15 @@ def api_runtime(tmp_path, monkeypatch):
         "provider": "openai",
     }
 
-    def load_picker_context():
-        return object()
-
-    def build_model_options_payload(_context, *, explicit_only=False):
-        runtime.catalog_calls.append(explicit_only)
+    def build_aux_picker_rows():
+        runtime.catalog_calls.append(True)
         if runtime.change_revision_during_catalog:
             runtime.change_revision_during_catalog = False
             (runtime.current_home / "config.yaml").write_text(
                 "changed while the catalog loaded",
                 encoding="utf-8",
             )
-        return copy.deepcopy(catalog_payload)
+        return copy.deepcopy(catalog_payload["providers"])
 
     hermes_cli = _module("hermes_cli", __version__="0.20.0")
     hermes_cli.__path__ = []
@@ -200,7 +231,10 @@ def api_runtime(tmp_path, monkeypatch):
             get_config_path=get_config_path,
             is_managed=lambda: runtime.managed,
             load_config=load_config,
-            save_config=save_config,
+            read_raw_config=lambda: (_ for _ in ()).throw(
+                AssertionError("The cached raw reader must not be used.")
+            ),
+            read_user_config_raw=read_user_config_raw,
         ),
         "hermes_cli.config_defaults": _module(
             "hermes_cli.config_defaults",
@@ -222,13 +256,16 @@ def api_runtime(tmp_path, monkeypatch):
         ),
         "hermes_cli.inventory": _module(
             "hermes_cli.inventory",
-            load_picker_context=load_picker_context,
-            build_model_options_payload=build_model_options_payload,
+            build_aux_picker_rows=build_aux_picker_rows,
         ),
         "hermes_constants": _module(
             "hermes_constants",
             set_hermes_home_override=set_home_override,
             reset_hermes_home_override=reset_home_override,
+        ),
+        "utils": _module(
+            "utils",
+            atomic_roundtrip_yaml_update=atomic_roundtrip_yaml_update,
         ),
     }
     for name, module in modules.items():
@@ -283,11 +320,60 @@ def test_get_state_is_profile_safe_dynamic_and_redacted(api_runtime):
     assert _task(state, "vision")["unsupported_entry_count"] == 0
 
     providers = state["catalog"]["providers"]
-    assert [row["slug"] for row in providers] == ["openai", "lmstudio"]
+    assert [row["slug"] for row in providers] == [
+        "openai",
+        "lmstudio",
+        "openai-codex",
+    ]
     assert "api_key" not in providers[0]
     assert "password" not in providers[1]
+    assert providers[2]["models"] == ["gpt-5.6-terra"]
     assert "secret_token" not in providers[0]["capabilities"]["gpt-vision"]
     assert runtime.catalog_calls == [True]
+    assert runtime.raw_read_paths == [runtime.work_home / "config.yaml"]
+    assert runtime.current_home == runtime.default_home
+
+
+def test_get_state_binds_data_to_one_stable_revision(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    runtime.change_revision_during_load = True
+
+    state = api.get_state("work")
+
+    assert state["revision"] == api._config_revision(runtime.work_home / "config.yaml")
+    assert _task(state, "vision")["chain"] == [
+        {"provider": "lmstudio", "model": "qwen-vl-7b"}
+    ]
+    assert runtime.raw_read_paths == [
+        runtime.work_home / "config.yaml",
+        runtime.work_home / "config.yaml",
+    ]
+
+
+def test_get_state_returns_safe_error_when_raw_read_fails(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    runtime.raw_read_error = PermissionError("secret-value-from-config")
+
+    with pytest.raises(HTTPException) as caught:
+        api.get_state("work")
+
+    assert caught.value.status_code == 503
+    assert caught.value.detail == "Hermes cannot read the raw configuration."
+    assert "secret-value-from-config" not in str(caught.value.detail)
+    assert runtime.raw_read_paths == [runtime.work_home / "config.yaml"]
+    assert runtime.current_home == runtime.default_home
+
+
+def test_get_state_fails_closed_without_uncached_raw_reader(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    config_module = sys.modules["hermes_cli.config"]
+    delattr(config_module, "read_user_config_raw")
+
+    with pytest.raises(HTTPException) as caught:
+        api.get_state("work")
+
+    assert caught.value.status_code == 503
+    assert "required configuration API" in str(caught.value.detail)
     assert runtime.current_home == runtime.default_home
 
 
@@ -316,9 +402,8 @@ def test_put_reorders_and_preserves_exact_pair_metadata(api_runtime):
     assert chain[1]["private_note"] == "keep-on-disk"
     assert chain[1]["timeout"] == 120
     assert saved["unrelated"] == {"keep": True}
-    assert runtime.save_calls[-1]["preserve_keys"] == {
-        ("auxiliary", "vision", "fallback_chain")
-    }
+    assert runtime.write_calls[-1]["path"] == runtime.work_home / "config.yaml"
+    assert runtime.write_calls[-1]["key"] == "auxiliary.vision.fallback_chain"
     assert _task(after, "vision")["chain"] == [
         {"provider": "lmstudio", "model": "qwen-vl-7b"},
         {"provider": "lmstudio", "model": "qwen-vl-4b"},
@@ -326,6 +411,48 @@ def test_put_reorders_and_preserves_exact_pair_metadata(api_runtime):
     assert "api_key" not in _task(after, "vision")["chain"][1]
     assert after["revision"] != before["revision"]
     assert runtime.current_home == runtime.default_home
+
+
+def test_put_partial_merge_keeps_change_made_during_save(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    before = api.get_state("work")
+    runtime.change_before_save = True
+
+    api.put_chain(
+        "vision",
+        {
+            "revision": before["revision"],
+            "chain": [{"provider": "lmstudio", "model": "qwen-vl-7b"}],
+        },
+        "work",
+    )
+
+    saved = runtime.configs[runtime.work_home]
+    assert saved["during_save"] == "keep"
+    assert saved["auxiliary"]["vision"]["fallback_chain"] == [
+        {"provider": "lmstudio", "model": "qwen-vl-7b"}
+    ]
+
+
+def test_put_accepts_configured_provider_with_exhausted_pool(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    before = api.get_state("work")
+
+    after = api.put_chain(
+        "vision",
+        {
+            "revision": before["revision"],
+            "chain": [
+                {"provider": "openai-codex", "model": "gpt-5.6-terra"}
+            ],
+        },
+        "work",
+    )
+
+    assert _task(after, "vision")["chain"] == [
+        {"provider": "openai-codex", "model": "gpt-5.6-terra"}
+    ]
+    assert runtime.write_calls[-1]["key"] == "auxiliary.vision.fallback_chain"
 
 
 def test_put_reorders_existing_offline_pair_and_preserves_timeout(api_runtime):
@@ -365,7 +492,7 @@ def test_put_reorders_existing_offline_pair_and_preserves_timeout(api_runtime):
     assert saved_chain[1]["timeout"] == 45
 
 
-def test_empty_chain_removes_only_the_fallback_key(api_runtime):
+def test_empty_chain_keeps_other_task_settings(api_runtime):
     api, runtime, _hermes_cli = api_runtime
     before = api.get_state("work")
 
@@ -376,11 +503,11 @@ def test_empty_chain_removes_only_the_fallback_key(api_runtime):
     )
 
     vision = runtime.configs[runtime.work_home]["auxiliary"]["vision"]
-    assert "fallback_chain" not in vision
+    assert vision["fallback_chain"] == []
     assert vision["provider"] == "openai"
     assert vision["timeout"] == 99
     assert runtime.configs[runtime.work_home]["unrelated"] == {"keep": True}
-    assert runtime.save_calls[-1]["preserve_keys"] is None
+    assert runtime.write_calls[-1]["key"] == "auxiliary.vision.fallback_chain"
     assert _task(after, "vision")["chain"] == []
 
 
@@ -403,7 +530,7 @@ def test_stale_revision_returns_409_without_a_save(api_runtime):
         )
 
     assert caught.value.status_code == 409
-    assert runtime.save_calls == []
+    assert runtime.write_calls == []
 
 
 def test_revision_changes_for_same_size_content_and_mtime(api_runtime):
@@ -443,7 +570,7 @@ def test_unsupported_legacy_entry_is_visible_and_blocks_write(api_runtime):
 
     assert caught.value.status_code == 409
     assert "legacy or unsupported" in str(caught.value.detail)
-    assert runtime.save_calls == []
+    assert runtime.write_calls == []
     assert vision["fallback_chain"][-1] == {"provider": "legacy-provider"}
     assert runtime.current_home == runtime.default_home
 
@@ -464,7 +591,28 @@ def test_revision_change_after_load_returns_409(api_runtime):
         )
 
     assert caught.value.status_code == 409
-    assert runtime.save_calls == []
+    assert runtime.write_calls == []
+    assert runtime.current_home == runtime.default_home
+
+
+def test_revision_change_while_config_loads_returns_409(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    before = api.get_state("work")
+    runtime.change_revision_during_load = True
+
+    with pytest.raises(HTTPException) as caught:
+        api.put_chain(
+            "vision",
+            {
+                "revision": before["revision"],
+                "chain": [{"provider": "lmstudio", "model": "qwen-vl-7b"}],
+            },
+            "work",
+        )
+
+    assert caught.value.status_code == 409
+    assert runtime.configs[runtime.work_home]["concurrent"] == "keep"
+    assert runtime.write_calls == []
     assert runtime.current_home == runtime.default_home
 
 
@@ -515,7 +663,7 @@ def test_put_rejects_unsafe_or_invalid_chains(api_runtime, chain, message):
 
     assert caught.value.status_code == 422
     assert message in str(caught.value.detail)
-    assert runtime.save_calls == []
+    assert runtime.write_calls == []
 
 
 def test_unknown_task_and_profile_errors_do_not_write(api_runtime):
@@ -537,7 +685,28 @@ def test_unknown_task_and_profile_errors_do_not_write(api_runtime):
     with pytest.raises(HTTPException) as missing_profile:
         api.get_state("missing")
     assert missing_profile.value.status_code == 404
-    assert runtime.save_calls == []
+    assert runtime.write_calls == []
+    assert runtime.current_home == runtime.default_home
+
+
+def test_unsafe_config_task_key_is_not_exposed_or_written(api_runtime):
+    api, runtime, _hermes_cli = api_runtime
+    runtime.configs[runtime.work_home]["auxiliary"]["unsafe.task"] = {
+        "provider": "auto",
+        "model": "",
+    }
+    state = api.get_state("work")
+
+    assert "unsafe.task" not in {item["key"] for item in state["tasks"]}
+    with pytest.raises(HTTPException) as caught:
+        api.put_chain(
+            "unsafe.task",
+            {"revision": state["revision"], "chain": []},
+            "work",
+        )
+
+    assert caught.value.status_code == 404
+    assert runtime.write_calls == []
     assert runtime.current_home == runtime.default_home
 
 
@@ -556,7 +725,7 @@ def test_managed_configuration_blocks_global_and_key_writes(api_runtime):
     with pytest.raises(HTTPException) as key_managed:
         api.put_chain("vision", request, "work")
     assert key_managed.value.status_code == 403
-    assert runtime.save_calls == []
+    assert runtime.write_calls == []
 
 
 @pytest.mark.parametrize("version", ["0.19.1", "not-a-version"])
@@ -575,7 +744,7 @@ def test_compatibility_check_blocks_unsupported_versions(api_runtime, version):
             "work",
         )
     assert caught.value.status_code == 503
-    assert runtime.save_calls == []
+    assert runtime.write_calls == []
 
 
 @pytest.mark.parametrize("version", ["0.20.0", "0.21.0"])

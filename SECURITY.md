@@ -25,6 +25,8 @@ The installer and removal script reject a Hermes home that is inside any detecte
 | `scripts/profile_targets.py` | No writes. It resolves existing Hermes profile paths. | None. |
 | `scripts/vision_fallback_smoke.py` | Creates one UUID-named temporary profile. It removes that profile after a clean test and preserves it if protected data changes. | Sends the selected image to the configured fallback provider. This action can use quota or incur cost. |
 
+The sidecar lock coordinates only this extension. Do not edit this plugin's allow-list while installation or removal is in progress. A matching external edit at the final write boundary can look like this transaction. The project does not add a transaction marker to the Hermes configuration.
+
 ## Credential handling
 
 - The Desktop page receives a redacted provider catalog.
@@ -35,4 +37,4 @@ The installer and removal script reject a Hermes home that is inside any detecte
 
 ## Update safety
 
-Hermes updates can change plugin APIs. Version 1.0.0 is tested with Hermes Agent 0.20.0 on Windows. The backend checks the public Hermes version before it writes a fallback chain. A future Hermes version can still need a plugin update if its public extension contract changes.
+Hermes updates can change plugin APIs. Version 1.0.0 is tested with a current Hermes Agent 0.20.0 build on Windows. The backend checks the public Hermes version and required configuration API before it writes a fallback chain. A future Hermes version can still need a plugin update if its public extension contract changes.

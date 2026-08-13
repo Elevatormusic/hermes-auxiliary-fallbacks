@@ -48,35 +48,30 @@ class PluginStateTests(TestCase):
             "save_calls": 0,
         }
 
-        def load_config():
+        def load_config(_path=None):
             state["read_calls"] += 1
             hook = state.get("on_read")
             if hook is not None:
                 hook(state)
             return copy.deepcopy(state["config"])
 
-        def save_config(config, *, preserve_keys=None, merge_existing=False):
+        def write_config_value(_path, key_path, value):
             state["save_calls"] += 1
-            state["save_options"] = {
-                "preserve_keys": preserve_keys,
-                "merge_existing": merge_existing,
-            }
+            state["save_options"] = {"key_path": key_path}
             if persist:
-                if merge_existing:
-                    merged = copy.deepcopy(state["config"])
-                    for key, value in config.items():
-                        merged[key] = copy.deepcopy(value)
-                    state["config"] = merged
-                else:
-                    state["config"] = copy.deepcopy(config)
+                state["config"][key_path] = copy.deepcopy(value)
 
         package = types.ModuleType("hermes_cli")
         package.__path__ = []
         config = types.ModuleType("hermes_cli.config")
         config.is_managed = lambda: managed
         config.get_config_path = lambda: self.fixture / "home" / "config.yaml"
-        config.read_raw_config = load_config
-        config.save_config = save_config
+        config.read_raw_config = lambda: (_ for _ in ()).throw(
+            AssertionError("The cached raw reader must not be used.")
+        )
+        config.read_user_config_raw = load_config
+        utils = types.ModuleType("utils")
+        utils.atomic_roundtrip_yaml_update = write_config_value
         constants = types.ModuleType("hermes_constants")
         constants.set_hermes_home_override = lambda _path: object()
         constants.reset_hermes_home_override = lambda _token: None
@@ -84,6 +79,7 @@ class PluginStateTests(TestCase):
             "hermes_cli": package,
             "hermes_cli.config": config,
             "hermes_constants": constants,
+            "utils": utils,
         }
 
     def run_action(
@@ -91,9 +87,12 @@ class PluginStateTests(TestCase):
         action: str,
         modules: dict[str, types.ModuleType],
         receipt: Path | None = None,
+        configure=None,
     ) -> int:
         """Run one helper action with the test runtime."""
         script = load_script()
+        if configure is not None:
+            configure(script)
         argv = [
             "plugin_state.py",
             action,
@@ -126,7 +125,7 @@ class PluginStateTests(TestCase):
         self.assertEqual(self.run_action("enable", modules), 0)
         self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
         self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
-        self.assertTrue(state["save_options"]["merge_existing"])
+        self.assertEqual(state["save_options"]["key_path"], "plugins")
 
     def test_disable_is_verified_after_save(self) -> None:
         state, modules = self.modules(managed=False, persist=True)
@@ -198,6 +197,84 @@ class PluginStateTests(TestCase):
         self.assertEqual(state["save_calls"], 0)
         self.assertEqual(state["config"]["theme"], "concurrent")
         self.assertTrue(receipt.is_file())
+        self.assertEqual(
+            load_script()._read_receipt(receipt)["status"],
+            "prepared",
+        )
+
+    def test_matching_external_change_keeps_prepared_receipt(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+
+        def enable_on_second_read(runtime_state) -> None:
+            if runtime_state["read_calls"] == 2:
+                runtime_state["config"]["plugins"]["enabled"].append(
+                    "auxiliary-fallbacks"
+                )
+
+        state["on_read"] = enable_on_second_read
+        receipt = self.fixture / "external.receipt.json"
+        with self.assertRaisesRegex(SystemExit, "allow-list changed"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertEqual(load_script()._read_receipt(receipt)["status"], "prepared")
+        with self.assertRaisesRegex(SystemExit, "not marked applied"):
+            self.run_action("rollback", modules, receipt)
+        self.assertIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_receipt_finalization_failure_happens_before_save(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+
+        def fail_receipt(_path) -> None:
+            raise OSError("receipt replace failed")
+
+        with self.assertRaisesRegex(OSError, "receipt replace failed"):
+            self.run_action(
+                "enable",
+                modules,
+                self.fixture / "finalization.receipt.json",
+                configure=lambda script: setattr(
+                    script,
+                    "_mark_receipt_applied",
+                    fail_receipt,
+                ),
+            )
+
+        self.assertEqual(state["save_calls"], 0)
+        self.assertNotIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
+
+    def test_rollback_recovers_when_save_raises_after_write(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        utils_module = modules["utils"]
+        original_save = utils_module.atomic_roundtrip_yaml_update
+        receipt = self.fixture / "write-then-fail.receipt.json"
+
+        def write_then_fail(*args, **kwargs) -> None:
+            original_save(*args, **kwargs)
+            raise OSError("failure after write")
+
+        utils_module.atomic_roundtrip_yaml_update = write_then_fail
+        with self.assertRaisesRegex(OSError, "failure after write"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
+        self.assertEqual(load_script()._read_receipt(receipt)["status"], "applied")
+
+        utils_module.atomic_roundtrip_yaml_update = original_save
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+        self.assertNotIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
 
 
 if __name__ == "__main__":

@@ -194,7 +194,7 @@ def _read_receipt(path: Path) -> dict[str, Any]:
 
 
 def _mark_receipt_applied(path: Path) -> None:
-    """Mark a receipt after the requested state is verified."""
+    """Mark a receipt immediately before the configuration write."""
 
     path = path.resolve()
     payload = _read_receipt(path)
@@ -232,7 +232,10 @@ def _stable_raw_config(read_raw_config: Any, path: Path) -> tuple[dict[str, Any]
 
     for _attempt in range(3):
         before = _config_revision(path)
-        config = read_raw_config()
+        try:
+            config = read_raw_config(path)
+        except Exception as exc:
+            raise SystemExit("Hermes cannot read the raw configuration.") from exc
         after = _config_revision(path)
         if before == after:
             if not isinstance(config, dict):
@@ -244,12 +247,13 @@ def _stable_raw_config(read_raw_config: Any, path: Path) -> tuple[dict[str, Any]
 def _save_membership(
     *,
     read_raw_config: Any,
-    save_config: Any,
+    write_config_value: Any,
     config_path: Path,
     expected_revision: str,
     expected: Mapping[str, bool],
     desired: Mapping[str, bool],
     operation: str,
+    before_save: Any | None = None,
 ) -> None:
     """Check again, then save only the current plugin allow-list."""
 
@@ -271,12 +275,13 @@ def _save_membership(
             "The Hermes configuration changed during the operation. "
             "The current configuration was preserved."
         )
-    save_config(
-        partial,
-        preserve_keys={("plugins", "enabled"), ("plugins", "disabled")},
-        merge_existing=True,
-    )
-    saved = read_raw_config()
+    if before_save is not None:
+        before_save()
+    write_config_value(config_path, "plugins", partial["plugins"])
+    try:
+        saved = read_raw_config(config_path)
+    except Exception as exc:
+        raise SystemExit("Hermes cannot verify the saved configuration.") from exc
     if not isinstance(saved, Mapping) or _membership(saved) != dict(desired):
         raise SystemExit(f"Hermes did not persist the requested plugin state: {operation}.")
 
@@ -293,12 +298,23 @@ def main() -> int:
 
     token = set_hermes_home_override(args.hermes_home.resolve())
     try:
-        from hermes_cli.config import (
-            get_config_path,
-            is_managed,
-            read_raw_config,
-            save_config,
-        )
+        from hermes_cli import config as hermes_config
+
+        get_config_path = hermes_config.get_config_path
+        is_managed = hermes_config.is_managed
+        read_raw_config = getattr(hermes_config, "read_user_config_raw", None)
+        try:
+            from utils import atomic_roundtrip_yaml_update
+        except ImportError as exc:
+            raise SystemExit(
+                "This Hermes build does not provide the required configuration API."
+            ) from exc
+
+        write_config_value = atomic_roundtrip_yaml_update
+        if not callable(read_raw_config) or not callable(write_config_value):
+            raise SystemExit(
+                "This Hermes build does not provide the required configuration API."
+            )
 
         if is_managed():
             raise SystemExit(
@@ -320,7 +336,7 @@ def main() -> int:
                 if current_membership != before:
                     _save_membership(
                         read_raw_config=read_raw_config,
-                        save_config=save_config,
+                        write_config_value=write_config_value,
                         config_path=config_path,
                         expected_revision=revision,
                         expected=after,
@@ -339,14 +355,14 @@ def main() -> int:
                 )
                 _save_membership(
                     read_raw_config=read_raw_config,
-                    save_config=save_config,
+                    write_config_value=write_config_value,
                     config_path=config_path,
                     expected_revision=revision,
                     expected=before,
                     desired=after,
                     operation=args.action,
+                    before_save=lambda: _mark_receipt_applied(args.receipt),
                 )
-                _mark_receipt_applied(args.receipt)
     finally:
         reset_hermes_home_override(token)
 

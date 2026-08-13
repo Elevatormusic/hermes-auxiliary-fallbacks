@@ -117,6 +117,69 @@ def _config_revision(config_path: Path) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
+def _stable_config_snapshot(
+    config_path: Path,
+    read_config: Any,
+) -> tuple[dict[str, Any], str]:
+    """Load configuration that matches one stable content revision."""
+
+    for _attempt in range(3):
+        before = _config_revision(config_path)
+        try:
+            config = copy.deepcopy(read_config(config_path))
+        except Exception as exc:
+            raise _http_error(
+                503,
+                "Hermes cannot read the raw configuration.",
+            ) from exc
+        after = _config_revision(config_path)
+        if before == after:
+            if not isinstance(config, dict):
+                raise _http_error(503, "Hermes returned an invalid configuration.")
+            return config, after
+    raise _http_error(
+        409,
+        "The Hermes configuration changed repeatedly. Reload the page and try again.",
+    )
+
+
+def _raw_config_reader() -> Any:
+    """Return the public uncached Hermes raw-config reader."""
+
+    try:
+        from hermes_cli import config as hermes_config
+    except ImportError as exc:
+        raise _http_error(
+            503,
+            "This Hermes build does not provide the required configuration API.",
+        ) from exc
+    reader = getattr(hermes_config, "read_user_config_raw", None)
+    if not callable(reader):
+        raise _http_error(
+            503,
+            "This Hermes build does not provide the required configuration API.",
+        )
+    return reader
+
+
+def _roundtrip_config_writer() -> Any:
+    """Return the public Hermes exact-key configuration writer."""
+
+    try:
+        from utils import atomic_roundtrip_yaml_update
+    except ImportError as exc:
+        raise _http_error(
+            503,
+            "This Hermes build does not provide the required configuration API.",
+        ) from exc
+    if not callable(atomic_roundtrip_yaml_update):
+        raise _http_error(
+            503,
+            "This Hermes build does not provide the required configuration API.",
+        )
+    return atomic_roundtrip_yaml_update
+
+
 def _fallback_compatibility() -> tuple[bool, str | None]:
     """Check the public Hermes version contract for this plugin."""
 
@@ -146,6 +209,14 @@ def _is_task_config(value: Any) -> bool:
     )
 
 
+def _is_safe_task_key(value: Any) -> bool:
+    """Return true when a task key is safe in a dotted config path."""
+
+    return isinstance(value, str) and bool(value) and all(
+        character.isalnum() or character == "_" for character in value
+    )
+
+
 def _task_label(task: str) -> str:
     """Return a short display label for an auxiliary task."""
 
@@ -171,7 +242,7 @@ def _discover_tasks(config: Mapping[str, Any]) -> list[dict[str, str]]:
     default_aux = DEFAULT_CONFIG.get("auxiliary", {})
     if isinstance(default_aux, Mapping):
         for key, value in default_aux.items():
-            if isinstance(key, str) and _is_task_config(value):
+            if _is_safe_task_key(key) and _is_task_config(value):
                 keys.add(key)
 
     try:
@@ -182,7 +253,7 @@ def _discover_tasks(config: Mapping[str, Any]) -> list[dict[str, str]]:
         if not isinstance(entry, Mapping):
             continue
         key = str(entry.get("key") or "").strip()
-        if not key:
+        if not _is_safe_task_key(key):
             continue
         keys.add(key)
         display_name = str(entry.get("display_name") or "").strip()
@@ -192,7 +263,7 @@ def _discover_tasks(config: Mapping[str, Any]) -> list[dict[str, str]]:
     config_aux = config.get("auxiliary", {})
     if isinstance(config_aux, Mapping):
         for key, value in config_aux.items():
-            if isinstance(key, str) and _is_task_config(value):
+            if _is_safe_task_key(key) and _is_task_config(value):
                 keys.add(key)
 
     ordered = [key for key, _label in _STANDARD_TASKS if key in keys]
@@ -253,12 +324,18 @@ def _safe_provider_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
 def _catalog() -> dict[str, list[dict[str, Any]]]:
     """Load the configured Hermes model catalog."""
 
-    from hermes_cli.inventory import build_model_options_payload, load_picker_context
+    try:
+        from hermes_cli.inventory import build_aux_picker_rows
+    except ImportError as exc:
+        raise _http_error(
+            503,
+            "This Hermes build does not provide the required auxiliary picker API.",
+        ) from exc
 
-    payload = build_model_options_payload(load_picker_context(), explicit_only=True)
-    if not isinstance(payload, Mapping):
+    rows = build_aux_picker_rows()
+    if not isinstance(rows, list):
         raise _http_error(503, "Hermes returned an invalid model catalog.")
-    return {"providers": _safe_provider_rows(payload)}
+    return {"providers": _safe_provider_rows({"providers": rows})}
 
 
 def _catalog_pairs(catalog: Mapping[str, Any]) -> set[tuple[str, str]]:
@@ -332,11 +409,7 @@ def _task_state(
 def _load_state_locked(profile: str, config_path: Path) -> dict[str, Any]:
     """Build one state response while the request holds the lock."""
 
-    from hermes_cli.config import load_config
-
-    config = load_config()
-    if not isinstance(config, Mapping):
-        raise _http_error(503, "Hermes returned an invalid configuration.")
+    config, revision = _stable_config_snapshot(config_path, _raw_config_reader())
 
     compatible, compatibility_error = _fallback_compatibility()
     task_info = _discover_tasks(config)
@@ -348,7 +421,7 @@ def _load_state_locked(profile: str, config_path: Path) -> dict[str, Any]:
         "compatible": compatible,
         "compatibility_error": compatibility_error,
         "profile": profile,
-        "revision": _config_revision(config_path),
+        "revision": revision,
         "tasks": [_task_state(item, auxiliary) for item in task_info],
         "catalog": _catalog(),
     }
@@ -460,7 +533,7 @@ def put_chain(
 ) -> dict[str, Any]:
     """Replace one task chain and return the new profile state."""
 
-    from hermes_cli.config import get_config_path, is_managed, load_config, save_config
+    from hermes_cli.config import get_config_path, is_managed
     from hermes_cli.managed_scope import is_key_managed
 
     with _config_transaction():
@@ -471,9 +544,10 @@ def put_chain(
             if is_managed():
                 raise _http_error(403, "This Hermes profile has managed configuration.")
 
-            config = copy.deepcopy(load_config())
-            if not isinstance(config, dict):
-                raise _http_error(503, "Hermes returned an invalid configuration.")
+            config, current_revision = _stable_config_snapshot(
+                config_path,
+                _raw_config_reader(),
+            )
             task_info = _discover_tasks(config)
             known_tasks = {entry["key"] for entry in task_info}
             if task not in known_tasks:
@@ -482,7 +556,6 @@ def put_chain(
             if is_key_managed(managed_key):
                 raise _http_error(403, f"The setting '{managed_key}' is managed.")
 
-            current_revision = _config_revision(config_path)
             requested_revision = payload.get("revision")
             if requested_revision != current_revision:
                 raise _http_error(
@@ -537,17 +610,26 @@ def put_chain(
                     new_chain,
                 )
             else:
-                raw_task.pop("fallback_chain", None)
+                raw_task["fallback_chain"] = []
 
-            preserve_keys = (
-                {("auxiliary", task, "fallback_chain")} if new_chain else None
-            )
             if _config_revision(config_path) != current_revision:
                 raise _http_error(
                     409,
                     "The Hermes configuration changed. Reload the page and try again.",
                 )
-            save_config(config, preserve_keys=preserve_keys)
+            try:
+                _roundtrip_config_writer()(
+                    config_path,
+                    f"auxiliary.{task}.fallback_chain",
+                    copy.deepcopy(raw_task["fallback_chain"]),
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise _http_error(
+                    503,
+                    "Hermes cannot save the fallback chain.",
+                ) from exc
             return _load_state_locked(selected_profile, config_path)
 
 
