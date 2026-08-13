@@ -2,7 +2,7 @@
 
 > Give every Hermes Agent helper role its own ordered model fallback chain.
 
-![Version 1.0.0](https://img.shields.io/badge/version-1.0.0-CD7F32)
+![Version 1.0.1](https://img.shields.io/badge/version-1.0.1-CD7F32)
 [![License: MIT](https://img.shields.io/badge/license-MIT-B8860B.svg)](LICENSE)
 ![Hermes Agent 0.20+](https://img.shields.io/badge/Hermes--Agent-0.20%2B-FFD700)
 ![Installer: Windows PowerShell](https://img.shields.io/badge/installer-Windows%20PowerShell-DAA520)
@@ -64,7 +64,7 @@ Hermes tries a role chain before its general safety routes. Hermes 0.20 can stil
 | Standalone plugin files | Usually stay in the Hermes data home. Run the installer again if an update removes them. |
 | Hermes source and Electron files | Never changed by this project. |
 
-Hermes can change its plugin contract in a future release. Version 1.0.0 is verified with a Hermes Agent 0.20.0 build that provides `read_user_config_raw`. The backend blocks writes on older or incompatible builds and reports a clear compatibility error. A newer Hermes version can still need a plugin update.
+Hermes can change its plugin contract in a future release. Version 1.0.1 is verified with a Hermes Agent 0.20.0 build that provides `read_user_config_raw`. The backend blocks writes on older or incompatible builds and reports a clear compatibility error. A newer Hermes version can still need a plugin update.
 
 ## Requirements
 
@@ -99,7 +99,7 @@ Use `-HermesHome` only for a custom Hermes home that is not a standard named pro
 .\scripts\install.ps1 -HermesHome "D:\HermesData"
 ```
 
-`-HermesHome`, `-Profile`, and `-AllProfiles` are mutually exclusive. The scripts use the installed Hermes profile API to validate named profiles. An all-profile install uses one rollback boundary. If one profile fails, rollback changes only this plugin's allow-list membership in the latest configuration. It keeps unrelated current settings. Rollback stops when the membership differs from the expected transaction states. Do not edit this plugin's allow-list while installation or removal is in progress. Failed copied plugin folders move to the dated backup instead of being deleted.
+`-HermesHome`, `-Profile`, and `-AllProfiles` are mutually exclusive. The scripts use the installed Hermes profile API to validate named profiles. An all-profile install uses one rollback boundary. If one profile fails, rollback changes only this plugin's allow-list membership in the latest configuration. It keeps unrelated current settings. A transaction receipt identifies a prepared replacement and makes an interrupted write recoverable. Rollback stops when the membership or receipt evidence is ambiguous. Do not edit Hermes plugin settings while installation or removal is in progress. Failed copied plugin folders move to the dated backup instead of being deleted.
 
 The installer copies files to these Hermes data folders:
 
@@ -201,9 +201,9 @@ See [SECURITY.md](SECURITY.md) for the full write boundary, rollback behavior, n
 
 ## Verification
 
-Version 1.0.0 was verified with a current Hermes Agent 0.20.0 build on Windows:
+Version 1.0.1 was verified with a current Hermes Agent 0.20.0 build on Windows:
 
-- 42 focused Python tests passed.
+- 52 focused Python tests passed. One POSIX-only symlink test was skipped on Windows and runs in Ubuntu CI.
 - Python compile, Desktop plugin syntax, and Windows PowerShell 5.1 parser checks passed.
 - Install and removal scripts rejected Hermes source-tree targets.
 - The installed backend returned all eight standard roles and only configured provider catalog entries.

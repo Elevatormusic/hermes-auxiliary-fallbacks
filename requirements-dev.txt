@@ -2,3 +2,4 @@ fastapi>=0.115,<1
 packaging>=24,<26
 pytest>=8,<10
 PyYAML>=6,<7
+ruamel.yaml>=0.18,<1

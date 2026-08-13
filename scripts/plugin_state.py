@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import sys
@@ -147,10 +148,11 @@ def _write_receipt(
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 1,
+        "version": 2,
         "plugin_id": PLUGIN_ID,
         "action": action,
         "status": "prepared",
+        "candidate_revision": None,
         "before": dict(before),
         "after": dict(after),
     }
@@ -158,6 +160,7 @@ def _write_receipt(
         with path.open("x", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
             handle.flush()
+            os.fsync(handle.fileno())
     except FileExistsError as exc:
         raise SystemExit(f"The transaction receipt already exists: {path}") from exc
 
@@ -174,16 +177,25 @@ def _read_receipt(path: Path) -> dict[str, Any]:
         "plugin_id",
         "action",
         "status",
+        "candidate_revision",
         "before",
         "after",
     }:
         raise SystemExit("The transaction receipt has an unsupported shape.")
-    if payload["version"] != 1 or payload["plugin_id"] != PLUGIN_ID:
+    if payload["version"] != 2 or payload["plugin_id"] != PLUGIN_ID:
         raise SystemExit("The transaction receipt is for a different plugin or version.")
     if payload["action"] not in {"enable", "disable"}:
         raise SystemExit("The transaction receipt has an unsupported action.")
-    if payload["status"] not in {"prepared", "applied"}:
+    if payload["status"] not in {"prepared", "armed", "committed", "applied"}:
         raise SystemExit("The transaction receipt has an unsupported status.")
+    candidate_revision = payload["candidate_revision"]
+    if candidate_revision is not None and (
+        not isinstance(candidate_revision, str)
+        or not candidate_revision.startswith("sha256:")
+    ):
+        raise SystemExit("The transaction receipt has an invalid candidate revision.")
+    if payload["status"] in {"armed", "committed", "applied"} and candidate_revision is None:
+        raise SystemExit("The armed transaction receipt has no candidate revision.")
     for key in ("before", "after"):
         value = payload[key]
         if not isinstance(value, dict) or set(value) != {"enabled", "disabled"}:
@@ -193,18 +205,14 @@ def _read_receipt(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _mark_receipt_applied(path: Path) -> None:
-    """Mark a receipt immediately before the configuration write."""
+def _replace_receipt(path: Path, payload: Mapping[str, Any]) -> None:
+    """Replace one transaction receipt and flush its complete state."""
 
     path = path.resolve()
-    payload = _read_receipt(path)
-    if payload["status"] != "prepared":
-        raise SystemExit("The transaction receipt was not in the prepared state.")
-    payload["status"] = "applied"
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with temporary.open("x", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
+            json.dump(dict(payload), handle, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -215,16 +223,49 @@ def _mark_receipt_applied(path: Path) -> None:
             pass
 
 
+def _arm_receipt(path: Path, candidate_revision: str) -> None:
+    """Arm a receipt for one prepared configuration replacement."""
+
+    payload = _read_receipt(path)
+    if payload["status"] != "prepared":
+        raise SystemExit("The transaction receipt was not in the prepared state.")
+    payload["status"] = "armed"
+    payload["candidate_revision"] = candidate_revision
+    _replace_receipt(path, payload)
+
+
+def _mark_receipt_applied(path: Path) -> None:
+    """Record that the requested configuration write was verified."""
+
+    payload = _read_receipt(path)
+    if payload["status"] != "committed":
+        raise SystemExit("The transaction receipt was not in the committed state.")
+    payload["status"] = "applied"
+    _replace_receipt(path, payload)
+
+
+def _mark_receipt_committed(path: Path, candidate_revision: str) -> None:
+    """Record that the prepared configuration replacement completed."""
+
+    payload = _read_receipt(path)
+    if payload["status"] != "armed":
+        raise SystemExit("The transaction receipt was not in the armed state.")
+    if payload["candidate_revision"] != candidate_revision:
+        raise SystemExit("The transaction receipt has a different candidate revision.")
+    payload["status"] = "committed"
+    _replace_receipt(path, payload)
+
+
 def _config_revision(path: Path) -> str:
     """Return a content revision for the raw configuration file."""
 
     try:
         content = path.read_bytes()
     except FileNotFoundError:
-        return "absent"
+        return "sha256:missing"
     except OSError as exc:
         raise SystemExit(f"The Hermes configuration cannot be read: {exc}") from exc
-    return hashlib.sha256(content).hexdigest()
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
 def _stable_raw_config(read_raw_config: Any, path: Path) -> tuple[dict[str, Any], str]:
@@ -247,13 +288,16 @@ def _stable_raw_config(read_raw_config: Any, path: Path) -> tuple[dict[str, Any]
 def _save_membership(
     *,
     read_raw_config: Any,
-    write_config_value: Any,
+    conditional_writer: Any,
+    conflict_error: type[Exception],
     config_path: Path,
     expected_revision: str,
     expected: Mapping[str, bool],
     desired: Mapping[str, bool],
     operation: str,
     before_save: Any | None = None,
+    after_replace: Any | None = None,
+    after_save: Any | None = None,
 ) -> None:
     """Check again, then save only the current plugin allow-list."""
 
@@ -270,20 +314,77 @@ def _save_membership(
         )
     partial = {"plugins": dict(latest.get("plugins", {}))}
     _set_membership(partial, desired)
-    if _config_revision(config_path) != revision:
+    try:
+        conditional_writer(
+            config_path,
+            "plugins",
+            partial["plugins"],
+            revision,
+            before_replace=(
+                (lambda candidate: before_save(candidate))
+                if before_save is not None
+                else None
+            ),
+            after_replace=(
+                (lambda candidate: after_replace(candidate))
+                if after_replace is not None
+                else None
+            ),
+        )
+    except conflict_error as exc:
         raise SystemExit(
             "The Hermes configuration changed during the operation. "
             "The current configuration was preserved."
-        )
-    if before_save is not None:
-        before_save()
-    write_config_value(config_path, "plugins", partial["plugins"])
+        ) from exc
+    except Exception:
+        raise SystemExit("Hermes cannot save the plugin allow-list.") from None
     try:
         saved = read_raw_config(config_path)
     except Exception as exc:
         raise SystemExit("Hermes cannot verify the saved configuration.") from exc
     if not isinstance(saved, Mapping) or _membership(saved) != dict(desired):
         raise SystemExit(f"Hermes did not persist the requested plugin state: {operation}.")
+    if after_save is not None:
+        after_save()
+
+
+def _load_config_write_support() -> tuple[Any, type[Exception]]:
+    """Load the plugin-owned conditional configuration writer."""
+
+    helper_path = (
+        Path(__file__).resolve().parents[1]
+        / "plugin"
+        / "agent"
+        / PLUGIN_ID
+        / "dashboard"
+        / "config_write.py"
+    )
+    module_name = f"auxiliary_fallbacks_config_write_{os.getpid()}"
+    try:
+        helper = sys.modules.get(module_name)
+        if helper is None:
+            spec = importlib.util.spec_from_file_location(module_name, helper_path)
+            if spec is None or spec.loader is None:
+                raise ImportError("Configuration write module cannot be loaded.")
+            helper = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = helper
+            try:
+                spec.loader.exec_module(helper)
+            except Exception:
+                sys.modules.pop(module_name, None)
+                raise
+    except Exception as exc:
+        raise SystemExit(
+            "This plugin installation is missing configuration write support."
+        ) from exc
+
+    conditional_writer = getattr(helper, "conditional_roundtrip_yaml_update", None)
+    conflict_error = getattr(helper, "ConfigConflict", RuntimeError)
+    if not callable(conditional_writer):
+        raise SystemExit(
+            "This plugin installation is missing configuration write support."
+        )
+    return conditional_writer, conflict_error
 
 
 def main() -> int:
@@ -303,15 +404,8 @@ def main() -> int:
         get_config_path = hermes_config.get_config_path
         is_managed = hermes_config.is_managed
         read_raw_config = getattr(hermes_config, "read_user_config_raw", None)
-        try:
-            from utils import atomic_roundtrip_yaml_update
-        except ImportError as exc:
-            raise SystemExit(
-                "This Hermes build does not provide the required configuration API."
-            ) from exc
-
-        write_config_value = atomic_roundtrip_yaml_update
-        if not callable(read_raw_config) or not callable(write_config_value):
+        conditional_writer, conflict_error = _load_config_write_support()
+        if not callable(read_raw_config):
             raise SystemExit(
                 "This Hermes build does not provide the required configuration API."
             )
@@ -324,24 +418,36 @@ def main() -> int:
         with _config_file_lock(config_path):
             if args.action == "rollback":
                 receipt = _read_receipt(args.receipt)
-                if receipt["status"] != "applied":
-                    raise SystemExit(
-                        "The transaction receipt was not marked applied. "
-                        "The current configuration was preserved."
-                    )
+                if receipt["status"] == "prepared":
+                    print(f"{PLUGIN_ID}: rollback complete")
+                    return 0
                 before = receipt["before"]
                 after = receipt["after"]
                 current, revision = _stable_raw_config(read_raw_config, config_path)
                 current_membership = _membership(current)
-                if current_membership != before:
+                if current_membership == after:
+                    if (
+                        receipt["status"] == "armed"
+                        and revision != receipt["candidate_revision"]
+                    ):
+                        raise SystemExit(
+                            "The configuration changed after this transaction. "
+                            "The current configuration was preserved."
+                        )
                     _save_membership(
                         read_raw_config=read_raw_config,
-                        write_config_value=write_config_value,
+                        conditional_writer=conditional_writer,
+                        conflict_error=conflict_error,
                         config_path=config_path,
                         expected_revision=revision,
                         expected=after,
                         desired=before,
                         operation="rollback",
+                    )
+                elif current_membership != before:
+                    raise SystemExit(
+                        "The plugin allow-list changed after this transaction. "
+                        "The current configuration was preserved."
                     )
             else:
                 config, revision = _stable_raw_config(read_raw_config, config_path)
@@ -355,13 +461,22 @@ def main() -> int:
                 )
                 _save_membership(
                     read_raw_config=read_raw_config,
-                    write_config_value=write_config_value,
+                    conditional_writer=conditional_writer,
+                    conflict_error=conflict_error,
                     config_path=config_path,
                     expected_revision=revision,
                     expected=before,
                     desired=after,
                     operation=args.action,
-                    before_save=lambda: _mark_receipt_applied(args.receipt),
+                    before_save=lambda candidate: _arm_receipt(
+                        args.receipt,
+                        candidate,
+                    ),
+                    after_replace=lambda candidate: _mark_receipt_committed(
+                        args.receipt,
+                        candidate,
+                    ),
+                    after_save=lambda: _mark_receipt_applied(args.receipt),
                 )
     finally:
         reset_hermes_home_override(token)

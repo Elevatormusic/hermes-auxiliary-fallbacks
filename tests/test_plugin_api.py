@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.util
 import os
 import sys
 import types
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -276,6 +278,50 @@ def api_runtime(tmp_path, monkeypatch):
     assert spec is not None and spec.loader is not None
     api = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(api)
+
+    class FakeConflict(RuntimeError):
+        """Represent a conditional write conflict in the fake runtime."""
+
+    class FakeUnavailable(RuntimeError):
+        """Represent an unavailable writer in the fake runtime."""
+
+    @contextmanager
+    def config_file_lock(_path):
+        yield
+
+    def conditional_writer(
+        path,
+        key_path,
+        value,
+        expected_revision,
+        *,
+        before_replace=None,
+        after_replace=None,
+    ):
+        path = Path(path)
+        if runtime.change_before_save:
+            runtime.change_before_save = False
+            runtime.configs[path.parent]["during_save"] = "keep"
+            path.write_text("changed immediately before commit", encoding="utf-8")
+        if api._config_revision(path) != expected_revision:
+            raise FakeConflict("revision changed")
+        candidate = "sha256:" + hashlib.sha256(repr(value).encode()).hexdigest()
+        if before_replace is not None:
+            before_replace(candidate)
+        if api._config_revision(path) != expected_revision:
+            raise FakeConflict("revision changed")
+        atomic_roundtrip_yaml_update(path, key_path, value)
+        candidate_revision = api._config_revision(path)
+        if after_replace is not None:
+            after_replace(candidate_revision)
+        return candidate_revision
+
+    api._config_write_support = lambda: (
+        conditional_writer,
+        config_file_lock,
+        FakeConflict,
+        FakeUnavailable,
+    )
     return api, runtime, hermes_cli
 
 
@@ -413,25 +459,26 @@ def test_put_reorders_and_preserves_exact_pair_metadata(api_runtime):
     assert runtime.current_home == runtime.default_home
 
 
-def test_put_partial_merge_keeps_change_made_during_save(api_runtime):
+def test_put_rejects_change_made_before_conditional_commit(api_runtime):
     api, runtime, _hermes_cli = api_runtime
     before = api.get_state("work")
     runtime.change_before_save = True
 
-    api.put_chain(
-        "vision",
-        {
-            "revision": before["revision"],
-            "chain": [{"provider": "lmstudio", "model": "qwen-vl-7b"}],
-        },
-        "work",
-    )
+    with pytest.raises(HTTPException) as caught:
+        api.put_chain(
+            "vision",
+            {
+                "revision": before["revision"],
+                "chain": [{"provider": "lmstudio", "model": "qwen-vl-7b"}],
+            },
+            "work",
+        )
 
     saved = runtime.configs[runtime.work_home]
+    assert caught.value.status_code == 409
     assert saved["during_save"] == "keep"
-    assert saved["auxiliary"]["vision"]["fallback_chain"] == [
-        {"provider": "lmstudio", "model": "qwen-vl-7b"}
-    ]
+    assert saved["auxiliary"]["vision"]["fallback_chain"][0]["model"] == "qwen-vl-4b"
+    assert runtime.write_calls == []
 
 
 def test_put_accepts_configured_provider_with_exhausted_pool(api_runtime):

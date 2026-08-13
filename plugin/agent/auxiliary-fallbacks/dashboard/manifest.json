@@ -1,7 +1,7 @@
 {
   "name": "auxiliary-fallbacks",
   "label": "Auxiliary Fallbacks",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "tab": {
     "path": "/auxiliary-fallbacks",
     "position": "end",

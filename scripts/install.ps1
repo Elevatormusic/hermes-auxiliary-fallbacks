@@ -108,8 +108,10 @@ $Hermes = Join-Path $ResolvedAgent "venv\Scripts\hermes.exe"
 
 $RequiredFiles = @(
     (Join-Path $SourceAgent "plugin.yaml"),
+    (Join-Path $SourceAgent "dashboard\config_write.py"),
     (Join-Path $SourceAgent "dashboard\plugin_api.py"),
     (Join-Path $SourceDesktop "plugin.js"),
+    (Join-Path $PSScriptRoot "plugin_state.py"),
     (Join-Path $PSScriptRoot "profile_targets.py"),
     $Python
 )

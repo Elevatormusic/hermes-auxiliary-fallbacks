@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib.util
+import sys
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -162,22 +164,39 @@ def _raw_config_reader() -> Any:
     return reader
 
 
-def _roundtrip_config_writer() -> Any:
-    """Return the public Hermes exact-key configuration writer."""
+def _config_write_support() -> tuple[Any, Any, type[Exception], type[Exception]]:
+    """Return this plugin's conditional configuration write support."""
 
     try:
-        from utils import atomic_roundtrip_yaml_update
-    except ImportError as exc:
+        module_name = f"{__name__}_config_write"
+        helper_path = Path(__file__).with_name("config_write.py")
+        helper = sys.modules.get(module_name)
+        if helper is None:
+            spec = importlib.util.spec_from_file_location(module_name, helper_path)
+            if spec is None or spec.loader is None:
+                raise ImportError("Configuration write module cannot be loaded.")
+            helper = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = helper
+            try:
+                spec.loader.exec_module(helper)
+            except Exception:
+                sys.modules.pop(module_name, None)
+                raise
+        conditional_roundtrip_yaml_update = helper.conditional_roundtrip_yaml_update
+        config_file_lock = helper.config_file_lock
+        ConfigConflict = helper.ConfigConflict
+        ConfigWriteUnavailable = helper.ConfigWriteUnavailable
+    except Exception as exc:
         raise _http_error(
             503,
-            "This Hermes build does not provide the required configuration API.",
+            "This plugin installation is missing configuration write support.",
         ) from exc
-    if not callable(atomic_roundtrip_yaml_update):
-        raise _http_error(
-            503,
-            "This Hermes build does not provide the required configuration API.",
-        )
-    return atomic_roundtrip_yaml_update
+    return (
+        conditional_roundtrip_yaml_update,
+        config_file_lock,
+        ConfigConflict,
+        ConfigWriteUnavailable,
+    )
 
 
 def _fallback_compatibility() -> tuple[bool, str | None]:
@@ -612,19 +631,27 @@ def put_chain(
             else:
                 raw_task["fallback_chain"] = []
 
-            if _config_revision(config_path) != current_revision:
+            writer, file_lock, conflict_error, unavailable_error = _config_write_support()
+            try:
+                with file_lock(config_path):
+                    writer(
+                        config_path,
+                        f"auxiliary.{task}.fallback_chain",
+                        copy.deepcopy(raw_task["fallback_chain"]),
+                        current_revision,
+                    )
+            except HTTPException:
+                raise
+            except conflict_error as exc:
                 raise _http_error(
                     409,
                     "The Hermes configuration changed. Reload the page and try again.",
-                )
-            try:
-                _roundtrip_config_writer()(
-                    config_path,
-                    f"auxiliary.{task}.fallback_chain",
-                    copy.deepcopy(raw_task["fallback_chain"]),
-                )
-            except HTTPException:
-                raise
+                ) from exc
+            except unavailable_error as exc:
+                raise _http_error(
+                    503,
+                    "Hermes cannot save the fallback chain.",
+                ) from exc
             except Exception as exc:
                 raise _http_error(
                     503,

@@ -1,0 +1,254 @@
+"""Write one Hermes configuration value only when its revision matches."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import tempfile
+import time
+from collections.abc import Callable
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator
+
+
+class ConfigConflict(RuntimeError):
+    """Report that the configuration changed during a conditional write."""
+
+
+class ConfigWriteUnavailable(RuntimeError):
+    """Report that the required YAML write support is not available."""
+
+
+@contextmanager
+def config_file_lock(path: Path, timeout_seconds: float = 10.0) -> Iterator[None]:
+    """Serialize this plugin's writes for one Hermes configuration file."""
+
+    lock_path = Path(path).with_name(f".{Path(path).name}.auxiliary-fallbacks.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
+
+    if os.name == "nt":
+        import msvcrt
+
+        handle = lock_path.open("a+b")
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b" ")
+                handle.flush()
+            while True:
+                try:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except (BlockingIOError, OSError, PermissionError) as exc:
+                    if time.monotonic() >= deadline:
+                        raise ConfigConflict(
+                            "Timed out while waiting for the configuration lock."
+                        ) from exc
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            handle.close()
+        return
+
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise ConfigWriteUnavailable(
+            "This platform does not provide a configuration file lock."
+        ) from exc
+
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, OSError) as exc:
+                if time.monotonic() >= deadline:
+                    raise ConfigConflict(
+                        "Timed out while waiting for the configuration lock."
+                    ) from exc
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def config_revision(path: Path) -> str:
+    """Return the SHA-256 revision for one configuration file."""
+
+    try:
+        content = Path(path).read_bytes()
+    except FileNotFoundError:
+        return "sha256:missing"
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def conditional_roundtrip_yaml_update(
+    path: Path,
+    key_path: str,
+    value: Any,
+    expected_revision: str,
+    *,
+    before_replace: Callable[[str], None] | None = None,
+    after_replace: Callable[[str], None] | None = None,
+) -> str:
+    """Update one YAML key if the file still has the expected revision.
+
+    The function prepares the complete replacement first. It then runs the
+    optional preparation callback, checks the file revision again, and requests
+    one atomic replace. It then runs the optional commit callback. A caller can
+    use the candidate revision to recover an interrupted transaction.
+    """
+
+    try:
+        from ruamel.yaml import YAML
+        from ruamel.yaml.comments import CommentedMap
+    except ImportError as exc:
+        raise ConfigWriteUnavailable(
+            "The required Hermes YAML write API is not available."
+        ) from exc
+
+    logical_target = Path(path)
+    try:
+        target_was_symlink = logical_target.is_symlink()
+        target = (
+            logical_target.resolve(strict=False)
+            if target_was_symlink
+            else logical_target
+        )
+    except (OSError, RuntimeError) as exc:
+        raise ConfigWriteUnavailable("The configuration path cannot be resolved.") from exc
+    keys = key_path.split(".")
+    if not keys or any(not key for key in keys):
+        raise ValueError("The configuration key path is not valid.")
+
+    try:
+        source_bytes = target.read_bytes()
+    except FileNotFoundError:
+        source_bytes = b""
+        source_missing = True
+    except OSError as exc:
+        raise ConfigWriteUnavailable("The configuration cannot be read.") from exc
+    else:
+        source_missing = False
+    source_revision = (
+        "sha256:missing"
+        if source_missing
+        else f"sha256:{hashlib.sha256(source_bytes).hexdigest()}"
+    )
+    if source_revision != expected_revision:
+        raise ConfigConflict("The configuration revision changed before the write.")
+    try:
+        source = source_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigWriteUnavailable("The configuration is not valid UTF-8.") from exc
+
+    yaml = YAML(typ="rt")
+    yaml.preserve_quotes = True
+    yaml.allow_unicode = True
+    yaml.default_flow_style = False
+    yaml.indent(mapping=2, sequence=4, offset=2)
+    try:
+        config = yaml.load(source) or CommentedMap()
+    except Exception as exc:
+        raise ConfigWriteUnavailable("The configuration YAML is not valid.") from exc
+    if not isinstance(config, CommentedMap):
+        if not isinstance(config, dict):
+            raise ConfigWriteUnavailable("The configuration root is not a mapping.")
+        config = CommentedMap(config)
+
+    current = config
+    for key in keys[:-1]:
+        next_value = current.get(key)
+        if not isinstance(next_value, CommentedMap):
+            next_value = CommentedMap()
+            current[key] = next_value
+        current = next_value
+    current[keys[-1]] = value
+
+    original_mode: int | None = None
+    original_owner: tuple[int, int] | None = None
+    try:
+        target_stat = target.stat()
+        original_mode = stat.S_IMODE(target_stat.st_mode)
+        if os.name == "posix":
+            original_owner = (target_stat.st_uid, target_stat.st_gid)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ConfigWriteUnavailable("The configuration metadata cannot be read.") from exc
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=str(target.parent),
+        prefix=f".{target.stem}_auxiliary_fallbacks_",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            yaml.dump(config, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        candidate_revision = config_revision(temporary)
+        if before_replace is not None:
+            before_replace(candidate_revision)
+
+        # Keep this check next to the replace. It is the conditional commit
+        # boundary for another Hermes process that writes the same profile.
+        try:
+            if target_was_symlink:
+                if (
+                    not logical_target.is_symlink()
+                    or logical_target.resolve(strict=False) != target
+                ):
+                    raise ConfigConflict(
+                        "The configuration link changed during the write."
+                    )
+            elif logical_target.is_symlink():
+                raise ConfigConflict("The configuration path changed during the write.")
+        except (OSError, RuntimeError) as exc:
+            raise ConfigConflict(
+                "The configuration path changed during the write."
+            ) from exc
+        if config_revision(target) != expected_revision:
+            raise ConfigConflict("The configuration changed during the write.")
+        try:
+            os.replace(temporary, target)
+        except OSError as exc:
+            raise ConfigWriteUnavailable(
+                "The configuration could not be replaced atomically."
+            ) from exc
+        real_path = target
+
+        if original_owner is not None and hasattr(os, "chown"):
+            try:
+                os.chown(real_path, original_owner[0], original_owner[1])
+            except OSError:
+                pass
+        if original_mode is not None:
+            try:
+                os.chmod(real_path, original_mode)
+            except OSError:
+                pass
+
+        if after_replace is not None:
+            after_replace(candidate_revision)
+
+        if config_revision(target) != candidate_revision:
+            raise ConfigConflict("The configuration changed after the write.")
+        return candidate_revision
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass

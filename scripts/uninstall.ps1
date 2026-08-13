@@ -98,6 +98,9 @@ function Invoke-GatewayRestart([string]$Command, [string]$TargetHome) {
     }
 }
 
+$RepositoryRoot = Split-Path -Parent $PSScriptRoot
+$SourceConfigWriter = Join-Path $RepositoryRoot "plugin\agent\$PluginId\dashboard\config_write.py"
+$PluginState = Join-Path $PSScriptRoot "plugin_state.py"
 $DefaultHermesRoot = Resolve-NormalizedPath (Join-Path $env:LOCALAPPDATA "hermes")
 $ResolvedAgent = Resolve-NormalizedPath $HermesAgent
 $Python = Join-Path $ResolvedAgent "venv\Scripts\python.exe"
@@ -105,6 +108,8 @@ $Hermes = Join-Path $ResolvedAgent "venv\Scripts\hermes.exe"
 $Resolver = Join-Path $PSScriptRoot "profile_targets.py"
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw "The Hermes Python runtime was not found at $Python" }
 if (-not (Test-Path -LiteralPath $Resolver -PathType Leaf)) { throw "The profile resolver was not found at $Resolver" }
+if (-not (Test-Path -LiteralPath $PluginState -PathType Leaf)) { throw "The plugin state helper was not found at $PluginState" }
+if (-not (Test-Path -LiteralPath $SourceConfigWriter -PathType Leaf)) { throw "The configuration writer was not found at $SourceConfigWriter" }
 if ($RestartGateway -and -not (Test-Path -LiteralPath $Hermes -PathType Leaf)) { throw "The Hermes command was not found at $Hermes" }
 
 if ($PSCmdlet.ParameterSetName -eq "Home") {
