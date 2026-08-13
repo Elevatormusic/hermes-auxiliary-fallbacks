@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import stat
 import tempfile
 import time
@@ -132,6 +133,68 @@ def config_revision(path: Path) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
+def _copy_windows_dacl(source: Path, destination: Path) -> None:
+    """Copy the source discretionary access control list to the replacement."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    dacl_security_information = 0x00000004
+    unprotected_dacl_security_information = 0x20000000
+    protected_dacl_security_information = 0x80000000
+    se_dacl_protected = 0x1000
+    error_insufficient_buffer = 122
+    required = wintypes.DWORD()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    get_file_security = advapi32.GetFileSecurityW
+    set_file_security = advapi32.SetFileSecurityW
+    get_security_descriptor_control = advapi32.GetSecurityDescriptorControl
+    if not get_file_security(str(source), dacl_security_information, None, 0, ctypes.byref(required)):
+        error = ctypes.get_last_error()
+        if error != error_insufficient_buffer or required.value == 0:
+            raise OSError(error, "Cannot read the configuration DACL.", str(source))
+    descriptor = ctypes.create_string_buffer(required.value)
+    if not get_file_security(str(source), dacl_security_information, descriptor, required.value, ctypes.byref(required)):
+        error = ctypes.get_last_error()
+        raise OSError(error, "Cannot read the configuration DACL.", str(source))
+    control = wintypes.WORD()
+    revision = wintypes.DWORD()
+    if not get_security_descriptor_control(
+        descriptor,
+        ctypes.byref(control),
+        ctypes.byref(revision),
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, "Cannot read the configuration DACL control state.", str(source))
+    dacl_control = (
+        protected_dacl_security_information
+        if control.value & se_dacl_protected
+        else unprotected_dacl_security_information
+    )
+    if not set_file_security(
+        str(destination),
+        dacl_security_information | dacl_control,
+        descriptor,
+    ):
+        error = ctypes.get_last_error()
+        raise OSError(error, "Cannot set the replacement DACL.", str(destination))
+
+
+def _copy_security_metadata(source: Path, destination: Path) -> None:
+    """Copy access metadata before the replacement becomes the configuration."""
+
+    try:
+        # On POSIX, copystat copies available extended attributes, including the
+        # system POSIX ACL. Windows needs the DACL copied separately.
+        shutil.copystat(source, destination, follow_symlinks=False)
+        if os.name == "nt":
+            _copy_windows_dacl(source, destination)
+    except OSError as exc:
+        raise ConfigWriteUnavailable(
+            "The configuration security metadata cannot be copied."
+        ) from exc
+
+
 def conditional_roundtrip_yaml_update(
     path: Path,
     key_path: str,
@@ -233,6 +296,8 @@ def conditional_roundtrip_yaml_update(
             yaml.dump(config, handle)
             handle.flush()
             os.fsync(handle.fileno())
+        if not source_missing:
+            _copy_security_metadata(target, temporary)
         candidate_revision = config_revision(temporary)
         if before_replace is not None:
             before_replace(candidate_revision)

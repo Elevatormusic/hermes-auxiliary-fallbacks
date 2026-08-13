@@ -237,9 +237,9 @@ def main() -> int:
     )
     protected_paths = {root_config_path, active_profile_path, active_config_path}
     protected_before = {path: snapshot(path) for path in protected_paths}
-    root_config_raw = yaml.safe_load(root_config_path.read_text(encoding="utf-8")) or {}
-    if not isinstance(root_config_raw, dict):
-        raise SystemExit(f"The root Hermes configuration is invalid: {root_config_path}")
+    active_config_raw = yaml.safe_load(active_config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(active_config_raw, dict):
+        raise SystemExit(f"The active Hermes configuration is invalid: {active_config_path}")
 
     profiles_root = hermes_root / "profiles"
     profiles_root_existed = profiles_root.exists()
@@ -249,7 +249,7 @@ def main() -> int:
     assert_safe_temp_profile(temp_dir, profiles_root, profile_name)
     temp_dir.mkdir(parents=True, exist_ok=False)
     temp_config = build_temp_config(
-        root_config_raw,
+        active_config_raw,
         args.fallback_provider,
         args.fallback_model,
     )

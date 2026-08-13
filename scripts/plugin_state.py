@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import stat
 import sys
 import time
 from collections.abc import Mapping
@@ -85,6 +86,87 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hermes-home", type=Path, required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     return parser.parse_args()
+
+
+def _absolute_lexical_path(path: Path) -> Path:
+    """Return an absolute path without following redirects."""
+
+    try:
+        return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+    except (OSError, TypeError, ValueError) as exc:
+        raise SystemExit("The Hermes profile path is not valid.") from exc
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Return true for a symlink, junction, or other reparse point."""
+
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise SystemExit("The Hermes profile path cannot be inspected.") from exc
+    if stat.S_ISLNK(path_stat.st_mode):
+        return True
+    attributes = getattr(path_stat, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse_flag)
+
+
+def _reject_reparse_ancestors(path: Path) -> None:
+    """Reject redirects in a profile path and its existing ancestors."""
+
+    for candidate in reversed((path, *path.parents)):
+        if _is_reparse_point(candidate):
+            raise SystemExit("The Hermes profile path uses a redirected path.")
+
+
+def _find_hermes_source_root(path: Path) -> Path | None:
+    """Find a Hermes Agent source root at or above a profile path."""
+
+    current = path if path.is_dir() else path.parent
+    while True:
+        try:
+            is_source = (
+                (current / "hermes_cli" / "config.py").is_file()
+                and (current / "hermes_constants.py").is_file()
+                and (current / "pyproject.toml").is_file()
+            )
+        except OSError as exc:
+            raise SystemExit("The Hermes profile path cannot be inspected.") from exc
+        if is_source:
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def _validate_hermes_home(path: Path) -> Path:
+    """Return a profile home that cannot redirect into Hermes source code."""
+
+    home = _absolute_lexical_path(path)
+    _reject_reparse_ancestors(home)
+    source_root = _find_hermes_source_root(home)
+    if source_root is not None:
+        raise SystemExit(
+            "A Hermes profile home cannot be inside a Hermes Agent source directory: "
+            f"{source_root}"
+        )
+    return home
+
+
+def _validate_config_path(home: Path, path: Path) -> Path:
+    """Return the exact safe configuration path for one Hermes profile."""
+
+    config_path = _absolute_lexical_path(path)
+    expected = _absolute_lexical_path(home / "config.yaml")
+    if os.path.normcase(os.fspath(config_path)) != os.path.normcase(os.fspath(expected)):
+        raise SystemExit("Hermes returned an unexpected configuration path.")
+    _reject_reparse_ancestors(config_path)
+    if _find_hermes_source_root(config_path.parent) is not None:
+        raise SystemExit("The Hermes configuration is inside a Hermes Agent source directory.")
+    return config_path
 
 
 def _plugin_lists(config: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
@@ -397,7 +479,8 @@ def main() -> int:
     sys.path.insert(0, str(agent_root))
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    token = set_hermes_home_override(args.hermes_home.resolve())
+    home = _validate_hermes_home(args.hermes_home)
+    token = set_hermes_home_override(home)
     try:
         from hermes_cli import config as hermes_config
 
@@ -414,7 +497,7 @@ def main() -> int:
             raise SystemExit(
                 "This Hermes profile is managed. The installer cannot change its plugin allow-list."
             )
-        config_path = get_config_path()
+        config_path = _validate_config_path(home, get_config_path())
         with _config_file_lock(config_path):
             if args.action == "rollback":
                 receipt = _read_receipt(args.receipt)

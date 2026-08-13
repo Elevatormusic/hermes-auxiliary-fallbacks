@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = (ROOT / "scripts" / "install.ps1", ROOT / "scripts" / "uninstall.ps1")
 POWERSHELL = shutil.which("powershell") or shutil.which("powershell.exe")
+PROFILE_TARGETS = ROOT / "scripts" / "profile_targets.py"
+
+
+def load_profile_targets():
+    """Load the profile target helper without running its command line."""
+
+    spec = importlib.util.spec_from_file_location("profile_targets_test", PROFILE_TARGETS)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def run_powershell(arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -33,6 +45,24 @@ def run_powershell(arguments: list[str]) -> subprocess.CompletedProcess[str]:
         text=True,
         encoding="utf-8",
     )
+
+
+def test_profile_target_keeps_a_lexical_redirect_path(tmp_path: Path) -> None:
+    """Do not follow a selected profile redirect before script safety checks."""
+
+    if not hasattr(Path, "symlink_to"):
+        pytest.skip("This platform does not provide symbolic links.")
+    target = tmp_path / "target"
+    target.mkdir()
+    redirected = tmp_path / "work"
+    try:
+        redirected.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("The test user cannot create a symbolic link.")
+
+    helper = load_profile_targets()
+    assert helper.absolute_lexical_path(redirected) == redirected.absolute()
+    assert helper.absolute_lexical_path(redirected) != redirected.resolve()
 
 
 @pytest.mark.parametrize("script", SCRIPTS, ids=lambda path: path.stem)

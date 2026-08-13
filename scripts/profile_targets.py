@@ -9,6 +9,12 @@ import sys
 from pathlib import Path
 
 
+def absolute_lexical_path(path: Path) -> Path:
+    """Return an absolute path without following a profile redirect."""
+
+    return Path(os.path.abspath(os.fspath(path)))
+
+
 def parse_args() -> argparse.Namespace:
     """Read command-line arguments."""
     parser = argparse.ArgumentParser()
@@ -42,7 +48,7 @@ def main() -> int:
 
     if args.all_profiles:
         rows = [
-            {"name": info.name, "path": str(Path(info.path).resolve())}
+            {"name": info.name, "path": str(absolute_lexical_path(Path(info.path)))}
             for info in list_profiles()
         ]
     else:
@@ -53,7 +59,7 @@ def main() -> int:
             raise SystemExit(str(exc)) from exc
         if not profile_exists(name):
             raise SystemExit(f"Hermes profile '{name}' does not exist.")
-        rows = [{"name": name, "path": str(get_profile_dir(name).resolve())}]
+        rows = [{"name": name, "path": str(absolute_lexical_path(get_profile_dir(name)))}]
 
     if not rows:
         raise SystemExit("Hermes did not return any profiles.")

@@ -157,6 +157,33 @@ class PluginStateTests(TestCase):
             self.run_action("enable", modules)
         self.assertEqual(state["save_calls"], 0)
 
+    def test_direct_helper_rejects_source_and_redirected_homes(self) -> None:
+        script = load_script()
+        source_home = self.fixture / "data" / "profile"
+        (self.fixture / "hermes_constants.py").write_text("", encoding="utf-8")
+        (self.fixture / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "inside a Hermes Agent source directory"):
+            script._validate_hermes_home(source_home)
+
+        safe_home = self.fixture.parent / f"home-{uuid.uuid4().hex}"
+        script._is_reparse_point = lambda candidate: candidate == safe_home
+        with self.assertRaisesRegex(SystemExit, "uses a redirected path"):
+            script._validate_hermes_home(safe_home)
+
+    def test_main_rejects_an_unsafe_home_before_override_or_write(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        calls: list[Path] = []
+        modules["hermes_constants"].set_hermes_home_override = lambda path: calls.append(path)
+        (self.fixture / "hermes_constants.py").write_text("", encoding="utf-8")
+        (self.fixture / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "inside a Hermes Agent source directory"):
+            self.run_action("enable", modules)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(state["save_calls"], 0)
+
     def test_silent_save_is_rejected(self) -> None:
         state, modules = self.modules(managed=False, persist=False)
         receipt = self.fixture / "silent.receipt.json"
