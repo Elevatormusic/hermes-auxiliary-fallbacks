@@ -1,0 +1,5 @@
+name: auxiliary-fallbacks
+version: "1.0.1"
+description: "Manage a separate ordered fallback chain for each Hermes auxiliary model role."
+author: "Shaya (Elevatormusic)"
+kind: standalone

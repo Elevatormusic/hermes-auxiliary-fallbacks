@@ -1,0 +1,953 @@
+"""Test safe plugin allow-list changes without a Hermes profile."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import importlib.util
+import os
+import subprocess
+import sys
+import types
+import uuid
+from pathlib import Path, PureWindowsPath
+from unittest import TestCase, main, mock
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "plugin_state.py"
+
+
+def load_script():
+    """Load a separate script module for one test."""
+    name = f"plugin_state_test_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class PluginStateTests(TestCase):
+    """Check managed-mode rejection and post-save verification."""
+
+    def setUp(self) -> None:
+        self.fixture = Path(__file__).parent / f"state-fixture-{uuid.uuid4().hex}"
+        (self.fixture / "hermes_cli").mkdir(parents=True)
+        (self.fixture / "home").mkdir()
+        (self.fixture / "hermes_cli" / "config.py").write_text("", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        for path in sorted(self.fixture.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            else:
+                path.rmdir()
+        self.fixture.rmdir()
+
+    def modules(self, *, managed: bool, persist: bool):
+        """Create a small Hermes configuration runtime."""
+        state = {
+            "config": {"plugins": {"enabled": [], "disabled": []}},
+            "read_calls": 0,
+            "save_calls": 0,
+        }
+
+        def load_config(_path=None):
+            state["read_calls"] += 1
+            hook = state.get("on_read")
+            if hook is not None:
+                hook(state)
+            return copy.deepcopy(state["config"])
+
+        class ConfigConflict(RuntimeError):
+            """Represent one conditional write conflict."""
+
+        def revision(path):
+            try:
+                content = Path(path).read_bytes()
+            except FileNotFoundError:
+                return "sha256:missing"
+            return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+        def conditional_writer(
+            path,
+            key_path,
+            value,
+            expected_revision,
+            *,
+            before_replace=None,
+            after_replace=None,
+        ):
+            path = Path(path)
+            marker = f"saved-{state['save_calls'] + 1}"
+            candidate = f"sha256:{hashlib.sha256(marker.encode()).hexdigest()}"
+            if before_replace is not None:
+                before_replace(candidate)
+            hook = state.get("after_receipt")
+            if hook is not None:
+                hook(state, path)
+            if revision(path) != expected_revision:
+                raise ConfigConflict("revision changed")
+            state["save_calls"] += 1
+            state["save_options"] = {"key_path": key_path}
+            if persist:
+                state["config"][key_path] = copy.deepcopy(value)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(marker, encoding="utf-8")
+            if after_replace is not None:
+                after_replace(candidate)
+            hook = state.get("after_replace")
+            if hook is not None:
+                hook(state, path)
+            if revision(path) != candidate:
+                raise ConfigConflict("revision changed after replace")
+            return candidate
+
+        package = types.ModuleType("hermes_cli")
+        package.__path__ = []
+        config = types.ModuleType("hermes_cli.config")
+        config.is_managed = lambda: managed
+        config.get_config_path = lambda: self.fixture / "home" / "config.yaml"
+        config.read_raw_config = lambda: (_ for _ in ()).throw(
+            AssertionError("The cached raw reader must not be used.")
+        )
+        config.read_user_config_raw = load_config
+        utils = types.ModuleType("utils")
+        utils.conditional_writer = conditional_writer
+        utils.ConfigConflict = ConfigConflict
+        constants = types.ModuleType("hermes_constants")
+        constants.set_hermes_home_override = lambda _path: object()
+        constants.reset_hermes_home_override = lambda _token: None
+        return state, {
+            "hermes_cli": package,
+            "hermes_cli.config": config,
+            "hermes_constants": constants,
+            "utils": utils,
+        }
+
+    def run_action(
+        self,
+        action: str,
+        modules: dict[str, types.ModuleType],
+        receipt: Path | None = None,
+        configure=None,
+    ) -> int:
+        """Run one helper action with the test runtime."""
+        script = load_script()
+        utils = modules["utils"]
+        script._load_config_write_support = lambda: (
+            utils.conditional_writer,
+            utils.ConfigConflict,
+        )
+        if configure is not None:
+            configure(script)
+        argv = [
+            "plugin_state.py",
+            action,
+            "--hermes-agent",
+            str(self.fixture),
+            "--hermes-home",
+            str(self.fixture / "home"),
+            "--receipt",
+            str(receipt or (self.fixture / "home" / f"{action}.receipt.json")),
+        ]
+        with mock.patch.dict(sys.modules, modules), mock.patch.object(sys, "argv", argv):
+            return script.main()
+
+    def receipt_path(self, name: str) -> Path:
+        """Return one receipt path inside the test profile home."""
+
+        return self.fixture / "home" / name
+
+    def test_managed_profile_is_rejected_before_save(self) -> None:
+        state, modules = self.modules(managed=True, persist=True)
+        with self.assertRaisesRegex(SystemExit, "profile is managed"):
+            self.run_action("enable", modules)
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_direct_helper_rejects_source_and_redirected_homes(self) -> None:
+        script = load_script()
+        source_home = self.fixture / "data" / "profile"
+        (self.fixture / "hermes_constants.py").write_text("", encoding="utf-8")
+        (self.fixture / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "inside a Hermes Agent source directory"):
+            script._validate_hermes_home(source_home)
+
+        safe_home = self.fixture.parent / f"home-{uuid.uuid4().hex}"
+        script._is_reparse_point = lambda candidate: candidate == safe_home
+        with self.assertRaisesRegex(SystemExit, "uses a redirected path"):
+            script._validate_hermes_home(safe_home)
+
+    def test_main_rejects_an_unsafe_home_before_override_or_write(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        calls: list[Path] = []
+        modules["hermes_constants"].set_hermes_home_override = lambda path: calls.append(path)
+        (self.fixture / "hermes_constants.py").write_text("", encoding="utf-8")
+        (self.fixture / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "inside a Hermes Agent source directory"):
+            self.run_action("enable", modules)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_config_path_requires_exact_home_and_file_case(self) -> None:
+        """Reject case-only changes in the expected configuration path."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        exact = home / "config.yaml"
+        case_home = self.fixture / "HOME" / "config.yaml"
+        case_file = home / "CONFIG.yaml"
+
+        self.assertEqual(script._validate_config_path(home, exact), exact.absolute())
+        with self.assertRaisesRegex(SystemExit, "unexpected configuration path"):
+            script._validate_config_path(home, case_home)
+        with self.assertRaisesRegex(SystemExit, "unexpected configuration path"):
+            script._validate_config_path(home, case_file)
+
+    def test_config_lock_rejects_redirect_before_open(self) -> None:
+        """Reject a profile redirect before the lock file can be created."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        redirected = False
+        script._is_reparse_point = lambda candidate: redirected and candidate == home
+        self.assertEqual(script._validate_config_path(home, config_path), config_path)
+        redirected = True
+
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            with script._config_file_lock(config_path):
+                self.fail("The redirected lock path was accepted.")
+
+        self.assertFalse(lock_path.exists())
+        redirected = False
+        external = self.fixture / "external-lock-sentinel.txt"
+        external.write_text("keep", encoding="utf-8")
+        real_open = Path.open
+
+        def open_then_redirect(current, *args, **kwargs):
+            nonlocal redirected
+            handle = real_open(current, *args, **kwargs)
+            if current == lock_path:
+                redirected = True
+            return handle
+
+        with mock.patch.object(Path, "open", open_then_redirect):
+            with self.assertRaisesRegex(SystemExit, "redirected path"):
+                with script._config_file_lock(config_path):
+                    self.fail("The redirected open lock was accepted.")
+
+        self.assertEqual(lock_path.stat().st_size, 0)
+        self.assertEqual(external.read_text(encoding="utf-8"), "keep")
+
+    def test_config_lock_rejects_redirect_after_acquisition(self) -> None:
+        """Reject a profile redirect after the lock is acquired."""
+
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        for scenario, error in (
+            ("redirect", "redirected path"),
+            ("source", "source directory"),
+            ("identity", "changed during acquisition"),
+        ):
+            with self.subTest(scenario=scenario):
+                script = load_script()
+                acquired = False
+                lock_calls: list[int] = []
+                fake_msvcrt = types.ModuleType("msvcrt")
+                fake_msvcrt.LK_NBLCK = 1
+                fake_msvcrt.LK_UNLCK = 2
+
+                def locking(_file_descriptor, mode, _length) -> None:
+                    nonlocal acquired
+                    lock_calls.append(mode)
+                    if mode == fake_msvcrt.LK_NBLCK:
+                        acquired = True
+
+                fake_msvcrt.locking = locking
+                real_os = script.os
+
+                class PathProxy:
+                    """Control the open-handle identity check."""
+
+                    def __getattr__(self, name: str):
+                        return getattr(real_os.path, name)
+
+                    @staticmethod
+                    def samestat(first, second) -> bool:
+                        if scenario == "identity" and acquired:
+                            return False
+                        return real_os.path.samestat(first, second)
+
+                class WindowsOsProxy:
+                    """Expose the Windows lock branch on each test platform."""
+
+                    name = "nt"
+                    path = PathProxy()
+
+                    def __getattr__(self, name: str):
+                        return getattr(real_os, name)
+
+                script.os = WindowsOsProxy()
+                script._is_reparse_point = lambda candidate: (
+                    scenario == "redirect" and acquired and candidate == home
+                )
+                if scenario == "source":
+                    script._find_hermes_source_root = lambda _path: (
+                        self.fixture if acquired else None
+                    )
+
+                with mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+                    with self.assertRaisesRegex(SystemExit, error):
+                        with script._config_file_lock(config_path):
+                            self.fail("The changed lock path was accepted.")
+
+                self.assertEqual(
+                    lock_calls,
+                    [fake_msvcrt.LK_NBLCK, fake_msvcrt.LK_UNLCK],
+                )
+                self.assertTrue(lock_path.is_file())
+
+        script = load_script()
+        acquired = False
+        flock_calls: list[int] = []
+        fake_fcntl = types.ModuleType("fcntl")
+        fake_fcntl.LOCK_EX = 1
+        fake_fcntl.LOCK_NB = 2
+        fake_fcntl.LOCK_UN = 4
+
+        def flock(_file_descriptor, operation) -> None:
+            nonlocal acquired
+            flock_calls.append(operation)
+            if operation == fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB:
+                acquired = True
+
+        fake_fcntl.flock = flock
+        real_os = script.os
+
+        class PathProxy:
+            """Reject the POSIX identity after lock acquisition."""
+
+            def __getattr__(self, name: str):
+                return getattr(real_os.path, name)
+
+            @staticmethod
+            def samestat(first, second) -> bool:
+                if acquired:
+                    return False
+                return real_os.path.samestat(first, second)
+
+        class PosixOsProxy:
+            """Expose the POSIX lock branch on each test platform."""
+
+            name = "posix"
+            path = PathProxy()
+
+            def __getattr__(self, name: str):
+                return getattr(real_os, name)
+
+        script.os = PosixOsProxy()
+        with mock.patch.dict(sys.modules, {"fcntl": fake_fcntl}):
+            with self.assertRaisesRegex(SystemExit, "changed during acquisition"):
+                with script._config_file_lock(config_path):
+                    self.fail("The changed POSIX lock was accepted.")
+
+        self.assertEqual(
+            flock_calls,
+            [fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB, fake_fcntl.LOCK_UN],
+        )
+        self.assertTrue(lock_path.is_file())
+
+    def test_config_lock_rejects_inaccessible_source_marker(self) -> None:
+        """Reject a marker inspection error without writing the lock."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        marker = home / "hermes_cli" / "config.py"
+        private_detail = "private-marker-detail"
+        real_stat = script.os.stat
+
+        def reject_marker(path, *args, **kwargs):
+            if Path(path) == marker:
+                raise PermissionError(private_detail)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(script.os, "stat", side_effect=reject_marker):
+            with self.assertRaisesRegex(SystemExit, "cannot be inspected") as caught:
+                with script._config_file_lock(config_path):
+                    self.fail("The inaccessible source marker was accepted.")
+
+        self.assertNotIn(private_detail, str(caught.exception))
+        self.assertNotIn(str(marker), str(caught.exception))
+        self.assertFalse(lock_path.exists())
+
+    def test_config_lock_rejects_real_posix_lock_symlink(self) -> None:
+        """Reject a real POSIX symlink at the persistent lock path."""
+
+        if os.name != "posix":
+            self.skipTest("This host does not provide POSIX symlinks.")
+
+        script = load_script()
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        external = self.fixture / "external-posix-lock.txt"
+        external.write_text("keep", encoding="utf-8")
+        try:
+            lock_path.symlink_to(external)
+        except OSError as exc:
+            self.skipTest(f"This host cannot create a test symlink: {exc.errno}")
+
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            with script._config_file_lock(config_path):
+                self.fail("The POSIX lock symlink was accepted.")
+
+        self.assertEqual(external.read_text(encoding="utf-8"), "keep")
+
+    def test_config_lock_rejects_real_windows_junction(self) -> None:
+        """Reject a real Windows junction in the profile namespace."""
+
+        if os.name != "nt":
+            self.skipTest("This host does not provide Windows junctions.")
+
+        script = load_script()
+        target = self.fixture / "junction-target"
+        junction = self.fixture / "junction-home"
+        target.mkdir()
+        result = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction),
+                str(target),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.skipTest("This host cannot create a test junction.")
+
+        try:
+            config_path = junction / "config.yaml"
+            target_lock = target / ".config.yaml.auxiliary-fallbacks.lock"
+            self.assertTrue(script._is_reparse_point(junction))
+            with self.assertRaisesRegex(SystemExit, "redirected path"):
+                with script._config_file_lock(config_path):
+                    self.fail("The Windows junction was accepted.")
+            self.assertFalse(target_lock.exists())
+        finally:
+            junction.rmdir()
+
+    def test_receipt_path_rejects_outside_sibling_and_source_paths(self) -> None:
+        """Reject receipt paths outside the safe profile home."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        outside = self.fixture.parent / f"outside-{uuid.uuid4().hex}.json"
+        sibling = self.fixture / "home-other" / "transaction.json"
+        case_sibling = self.fixture / "HOME" / "transaction.json"
+        descendant = home / "backup" / "transaction.json"
+        source = home / "source" / "transaction.json"
+        (source.parent / "hermes_cli").mkdir(parents=True)
+        (source.parent / "hermes_cli" / "config.py").write_text("", encoding="utf-8")
+        (source.parent / "hermes_constants.py").write_text("", encoding="utf-8")
+        (source.parent / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, outside)
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, sibling)
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, case_sibling)
+        with self.assertRaisesRegex(SystemExit, "outside"):
+            script._validate_receipt_path(home, home)
+        self.assertEqual(
+            script._validate_receipt_path(home, descendant),
+            script._absolute_lexical_path(descendant),
+        )
+        with self.assertRaisesRegex(SystemExit, "source directory"):
+            script._validate_receipt_path(home, source)
+
+    def test_lexical_descendant_uses_exact_windows_path_components(self) -> None:
+        """Handle Windows drives, roots, and UNC paths without case folding."""
+
+        script = load_script()
+        is_descendant = script._is_strict_lexical_descendant
+        accepted = (
+            (r"C:\Data\Hermes", r"C:\Data\Hermes\backup\transaction.json"),
+            ("C:\\", r"C:\backup\transaction.json"),
+            (
+                r"\\server\share\Hermes",
+                r"\\server\share\Hermes\backup\transaction.json",
+            ),
+            ("\\\\server\\share\\", r"\\server\share\transaction.json"),
+        )
+        rejected = (
+            (r"C:\Data\Hermes", r"C:\Data\hermes\backup\transaction.json"),
+            (r"C:\Data\Hermes", r"c:\Data\Hermes\backup\transaction.json"),
+            (r"C:\Data\Hermes", r"C:\Data\Hermes-other\transaction.json"),
+            (r"C:\Data\Hermes", r"D:\Data\Hermes\transaction.json"),
+            (r"C:\Data\Hermes", r"C:\Data\Hermes"),
+            (
+                r"\\server\share\Hermes",
+                r"\\SERVER\share\Hermes\transaction.json",
+            ),
+            (
+                r"\\server\share\Hermes",
+                r"\\server\other\Hermes\transaction.json",
+            ),
+        )
+
+        for home, receipt in accepted:
+            self.assertTrue(
+                is_descendant(PureWindowsPath(home), PureWindowsPath(receipt))
+            )
+        for home, receipt in rejected:
+            self.assertFalse(
+                is_descendant(PureWindowsPath(home), PureWindowsPath(receipt))
+            )
+
+    def test_receipt_path_rejects_a_redirected_ancestor(self) -> None:
+        """Reject a receipt path with a redirected existing ancestor."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = home / "backup" / "transaction.json"
+        script._is_reparse_point = lambda candidate: candidate == receipt.parent
+
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            script._validate_receipt_path(home, receipt)
+
+    def test_receipt_write_rejects_redirect_before_open(self) -> None:
+        """Reject a receipt redirect introduced before its first open."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("before-open.json")
+        external = self.fixture / f"external-{uuid.uuid4().hex}.json"
+        external.write_text("keep", encoding="utf-8")
+        validate = script._validate_receipt_path
+        calls = 0
+
+        def redirect_before_open(current_home, path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise SystemExit("The Hermes profile path uses a redirected path.")
+            return validate(current_home, path)
+
+        try:
+            script._validate_receipt_path = redirect_before_open
+            with self.assertRaisesRegex(SystemExit, "redirected path"):
+                script._write_receipt(
+                    receipt,
+                    home=home,
+                    action="enable",
+                    before={"enabled": False, "disabled": False},
+                    after={"enabled": True, "disabled": False},
+                )
+            self.assertFalse(receipt.exists())
+            self.assertEqual(external.read_text(encoding="utf-8"), "keep")
+        finally:
+            external.unlink(missing_ok=True)
+
+    def test_receipt_replace_rejects_redirect_before_replace(self) -> None:
+        """Reject a receipt redirect introduced before its atomic replacement."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("before-replace.json")
+        script._write_receipt(
+            receipt,
+            home=home,
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        validate = script._validate_receipt_path
+        calls = 0
+
+        def redirect_before_replace(current_home, path):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise SystemExit("The Hermes profile path uses a redirected path.")
+            return validate(current_home, path)
+
+        script._validate_receipt_path = redirect_before_replace
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            script._replace_receipt(receipt, {"status": "prepared"}, home=home)
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(
+            script._read_receipt(receipt, home=home)["status"],
+            "prepared",
+        )
+        self.assertEqual(list(home.glob(".before-replace.json.*.tmp")), [])
+
+    def test_receipt_cleanup_skips_redirected_temporary_path(self) -> None:
+        """Do not delete a temporary receipt after a redirect is detected."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("before-cleanup.json")
+        script._write_receipt(
+            receipt,
+            home=home,
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        validate = script._validate_receipt_path
+        calls = 0
+
+        def redirect_before_cleanup(current_home, path):
+            nonlocal calls
+            calls += 1
+            if calls == 5:
+                raise SystemExit("The Hermes profile path uses a redirected path.")
+            return validate(current_home, path)
+
+        script._validate_receipt_path = redirect_before_cleanup
+        with mock.patch.object(Path, "unlink", side_effect=AssertionError("unlink ran")):
+            script._replace_receipt(receipt, {"status": "prepared"}, home=home)
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(list(home.glob(".before-cleanup.json.*.tmp")), [])
+
+    def test_receipt_read_rejects_redirect_before_open(self) -> None:
+        """Reject a redirected receipt before rollback can read it."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("rollback-read.json")
+        script._write_receipt(
+            receipt,
+            home=home,
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        script._validate_receipt_path = lambda *_args: (_ for _ in ()).throw(
+            SystemExit("The Hermes profile path uses a redirected path.")
+        )
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            script._read_receipt(receipt, home=home)
+
+    def test_receipt_read_error_does_not_expose_content_or_path(self) -> None:
+        """Report receipt read errors with fixed text only."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        receipt = self.receipt_path("read-error.json")
+        receipt.write_text("api_key: must-not-leak", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "transaction receipt is not valid") as caught:
+            script._read_receipt(receipt, home=home)
+
+        self.assertNotIn("must-not-leak", str(caught.exception))
+        self.assertNotIn(str(receipt), str(caught.exception))
+
+    def test_silent_save_is_rejected(self) -> None:
+        state, modules = self.modules(managed=False, persist=False)
+        receipt = self.receipt_path("silent.receipt.json")
+        with self.assertRaisesRegex(SystemExit, "did not persist"):
+            self.run_action("enable", modules, receipt)
+        self.assertEqual(state["save_calls"], 1)
+        self.assertTrue(receipt.is_file())
+
+    def test_enable_is_verified_after_save(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        self.assertEqual(self.run_action("enable", modules), 0)
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+        self.assertEqual(state["save_options"]["key_path"], "plugins")
+
+    def test_disable_is_verified_after_save(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        state["config"]["plugins"]["enabled"] = ["auxiliary-fallbacks"]
+        self.assertEqual(self.run_action("disable", modules), 0)
+        self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+
+    def test_rollback_preserves_unrelated_current_settings(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.receipt_path("rollback.receipt.json")
+        self.assertEqual(self.run_action("enable", modules, receipt), 0)
+
+        state["config"]["theme"] = "current-user-value"
+        state["config"]["plugins"]["enabled"].append("another-plugin")
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+
+        self.assertEqual(state["config"]["theme"], "current-user-value")
+        self.assertEqual(state["config"]["plugins"]["enabled"], ["another-plugin"])
+        self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+
+    def test_rollback_rejects_target_membership_drift(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.receipt_path("drift.receipt.json")
+        self.assertEqual(self.run_action("enable", modules, receipt), 0)
+        state["config"]["plugins"]["disabled"].append("auxiliary-fallbacks")
+        save_calls = state["save_calls"]
+
+        with self.assertRaisesRegex(SystemExit, "changed after this transaction"):
+            self.run_action("rollback", modules, receipt)
+
+        self.assertEqual(state["save_calls"], save_calls)
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["disabled"])
+
+    def test_prepared_receipt_does_not_undo_matching_external_change(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.receipt_path("prepared.receipt.json")
+        script = load_script()
+        script._write_receipt(
+            receipt,
+            home=self.fixture / "home",
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        state["config"]["plugins"]["enabled"].append("auxiliary-fallbacks")
+
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_apply_rejects_config_change_before_save(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        config_path = self.fixture / "home" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def change_on_second_read(runtime_state) -> None:
+            if runtime_state["read_calls"] == 2:
+                config_path.write_text("theme: concurrent\n", encoding="utf-8")
+                runtime_state["config"]["theme"] = "concurrent"
+
+        state["on_read"] = change_on_second_read
+        receipt = self.receipt_path("concurrent.receipt.json")
+        with self.assertRaisesRegex(SystemExit, "configuration changed"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertEqual(state["save_calls"], 0)
+        self.assertEqual(state["config"]["theme"], "concurrent")
+        self.assertTrue(receipt.is_file())
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "prepared",
+        )
+
+    def test_matching_external_change_keeps_prepared_receipt(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+
+        def enable_on_second_read(runtime_state) -> None:
+            if runtime_state["read_calls"] == 2:
+                runtime_state["config"]["plugins"]["enabled"].append(
+                    "auxiliary-fallbacks"
+                )
+
+        state["on_read"] = enable_on_second_read
+        receipt = self.receipt_path("external.receipt.json")
+        with self.assertRaisesRegex(SystemExit, "allow-list changed"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "prepared",
+        )
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+        self.assertIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_change_after_receipt_arm_is_not_overwritten(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        config_path = self.fixture / "home" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def external_write(runtime_state, path) -> None:
+            runtime_state["after_receipt"] = None
+            runtime_state["config"]["plugins"]["custom_flag"] = "external"
+            path.write_text("plugins:\n  custom_flag: external\n", encoding="utf-8")
+
+        state["after_receipt"] = external_write
+        receipt = self.receipt_path("after-arm.receipt.json")
+        with self.assertRaisesRegex(SystemExit, "configuration changed"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertEqual(state["save_calls"], 0)
+        self.assertEqual(state["config"]["plugins"]["custom_flag"], "external")
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "armed",
+        )
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+        self.assertEqual(state["config"]["plugins"]["custom_flag"], "external")
+
+    def test_armed_receipt_rejects_a_non_candidate_revision(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        config_path = self.fixture / "home" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("before", encoding="utf-8")
+        receipt = self.receipt_path("armed-drift.receipt.json")
+        script = load_script()
+        script._write_receipt(
+            receipt,
+            home=self.fixture / "home",
+            action="enable",
+            before={"enabled": False, "disabled": False},
+            after={"enabled": True, "disabled": False},
+        )
+        script._arm_receipt(
+            receipt,
+            "sha256:" + "0" * 64,
+            home=self.fixture / "home",
+        )
+        state["config"]["plugins"]["enabled"].append("auxiliary-fallbacks")
+        config_path.write_text("external", encoding="utf-8")
+
+        with self.assertRaisesRegex(SystemExit, "changed after this transaction"):
+            self.run_action("rollback", modules, receipt)
+
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_receipt_arm_failure_happens_before_save(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+
+        def fail_receipt(_path, _candidate) -> None:
+            raise OSError("receipt replace failed")
+
+        with self.assertRaisesRegex(SystemExit, "cannot save the plugin allow-list"):
+            self.run_action(
+                "enable",
+                modules,
+                self.receipt_path("finalization.receipt.json"),
+                configure=lambda script: setattr(
+                    script,
+                    "_arm_receipt",
+                    fail_receipt,
+                ),
+            )
+
+        self.assertEqual(state["save_calls"], 0)
+        self.assertNotIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
+
+    def test_writer_error_does_not_expose_configuration_values(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.receipt_path("safe-error.receipt.json")
+
+        def fail_with_secret(*_args, **_kwargs) -> None:
+            raise RuntimeError("api_key: must-not-leak")
+
+        modules["utils"].conditional_writer = fail_with_secret
+        with self.assertRaisesRegex(
+            SystemExit,
+            "Hermes cannot save the plugin allow-list",
+        ) as caught:
+            self.run_action("enable", modules, receipt)
+
+        self.assertNotIn("must-not-leak", str(caught.exception))
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "prepared",
+        )
+        self.assertEqual(state["save_calls"], 0)
+
+    def test_receipt_apply_failure_is_recoverable(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.receipt_path("apply-failure.receipt.json")
+
+        def fail_receipt(_path, **_kwargs) -> None:
+            raise OSError("receipt apply failed")
+
+        with self.assertRaisesRegex(OSError, "receipt apply failed"):
+            self.run_action(
+                "enable",
+                modules,
+                receipt,
+                configure=lambda script: setattr(
+                    script,
+                    "_mark_receipt_applied",
+                    fail_receipt,
+                ),
+            )
+
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "committed",
+        )
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+        self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+
+    def test_sibling_change_after_replace_is_preserved_by_rollback(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        receipt = self.receipt_path("after-replace.receipt.json")
+
+        def external_write(runtime_state, path) -> None:
+            runtime_state["after_replace"] = None
+            runtime_state["config"]["plugins"]["custom_flag"] = "external"
+            path.write_text("saved-by-external-writer", encoding="utf-8")
+
+        state["after_replace"] = external_write
+        with self.assertRaisesRegex(SystemExit, "configuration changed"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "committed",
+        )
+        self.assertIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+        self.assertNotIn("auxiliary-fallbacks", state["config"]["plugins"]["enabled"])
+        self.assertEqual(state["config"]["plugins"]["custom_flag"], "external")
+
+    def test_rollback_recovers_when_save_raises_after_write(self) -> None:
+        state, modules = self.modules(managed=False, persist=True)
+        utils_module = modules["utils"]
+        original_save = utils_module.conditional_writer
+        receipt = self.receipt_path("write-then-fail.receipt.json")
+
+        def write_then_fail(*args, **kwargs) -> None:
+            original_save(*args, **kwargs)
+            raise OSError("failure after write")
+
+        utils_module.conditional_writer = write_then_fail
+        with self.assertRaisesRegex(SystemExit, "cannot save the plugin allow-list"):
+            self.run_action("enable", modules, receipt)
+
+        self.assertIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
+        self.assertEqual(
+            load_script()._read_receipt(receipt, home=self.fixture / "home")["status"],
+            "committed",
+        )
+
+        utils_module.conditional_writer = original_save
+        self.assertEqual(self.run_action("rollback", modules, receipt), 0)
+        self.assertNotIn(
+            "auxiliary-fallbacks",
+            state["config"]["plugins"]["enabled"],
+        )
+
+
+if __name__ == "__main__":
+    main()

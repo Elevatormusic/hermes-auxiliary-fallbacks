@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1420" height="760" viewBox="0 0 1420 760" role="img" aria-labelledby="title desc">
+  <title id="title">Hermes Auxiliary Fallbacks role editor</title>
+  <desc id="desc">A dark gold interface that shows separate fallback chains for Vision, Web extract, Compression, and Curator.</desc>
+  <rect width="1420" height="760" fill="#14110d"/>
+  <rect x="42" y="38" width="1336" height="684" rx="22" fill="#1b1711" stroke="#6d5621" stroke-width="2"/>
+  <text x="82" y="100" fill="#f5e7b2" font-family="Segoe UI, sans-serif" font-size="34" font-weight="700">Auxiliary Fallbacks</text>
+  <text x="82" y="140" fill="#a99d7d" font-family="Segoe UI, sans-serif" font-size="19">An independent ordered fallback chain for every helper role</text>
+  <rect x="1110" y="75" width="210" height="48" rx="10" fill="#2b2315" stroke="#b58c2b"/>
+  <text x="1152" y="106" fill="#e1bd55" font-family="Segoe UI, sans-serif" font-size="17" font-weight="600">Profile: default</text>
+  <g font-family="Segoe UI, sans-serif">
+    <rect x="82" y="184" width="1256" height="112" rx="14" fill="#211c14" stroke="#3e341f"/>
+    <text x="110" y="225" fill="#f7edca" font-size="21" font-weight="700">Vision</text>
+    <text x="110" y="257" fill="#95896b" font-size="16">Image analysis</text>
+    <rect x="390" y="207" width="300" height="58" rx="10" fill="#17140f" stroke="#8d6c22"/>
+    <text x="414" y="242" fill="#e7cb73" font-size="17">OpenAI · vision model</text>
+    <text x="718" y="243" fill="#816b34" font-size="25">→</text>
+    <rect x="758" y="207" width="318" height="58" rx="10" fill="#17140f" stroke="#8d6c22"/>
+    <text x="782" y="242" fill="#e7cb73" font-size="17">LM Studio · Qwen-VL</text>
+    <rect x="1138" y="211" width="154" height="50" rx="9" fill="#b58c2b"/>
+    <text x="1185" y="243" fill="#171109" font-size="17" font-weight="700">Saved</text>
+    <rect x="82" y="316" width="1256" height="112" rx="14" fill="#211c14" stroke="#3e341f"/>
+    <text x="110" y="357" fill="#f7edca" font-size="21" font-weight="700">Web extract</text>
+    <text x="110" y="389" fill="#95896b" font-size="16">Page summarization</text>
+    <rect x="390" y="339" width="300" height="58" rx="10" fill="#17140f" stroke="#5b4b27"/>
+    <text x="414" y="374" fill="#cbbd91" font-size="17">Main model</text>
+    <text x="718" y="375" fill="#816b34" font-size="25">→</text>
+    <rect x="758" y="339" width="318" height="58" rx="10" fill="#17140f" stroke="#8d6c22"/>
+    <text x="782" y="374" fill="#e7cb73" font-size="17">DGX Spark · local model</text>
+    <rect x="82" y="448" width="1256" height="112" rx="14" fill="#211c14" stroke="#3e341f"/>
+    <text x="110" y="489" fill="#f7edca" font-size="21" font-weight="700">Compression</text>
+    <text x="110" y="521" fill="#95896b" font-size="16">Context compaction</text>
+    <rect x="390" y="471" width="300" height="58" rx="10" fill="#17140f" stroke="#5b4b27"/>
+    <text x="414" y="506" fill="#cbbd91" font-size="17">Main model</text>
+    <text x="718" y="507" fill="#816b34" font-size="25">→</text>
+    <rect x="758" y="471" width="318" height="58" rx="10" fill="#17140f" stroke="#8d6c22"/>
+    <text x="782" y="506" fill="#e7cb73" font-size="17">Subscription B · compact</text>
+    <rect x="82" y="580" width="1256" height="112" rx="14" fill="#211c14" stroke="#3e341f"/>
+    <text x="110" y="621" fill="#f7edca" font-size="21" font-weight="700">Curator</text>
+    <text x="110" y="653" fill="#95896b" font-size="16">Skill-usage review</text>
+    <rect x="390" y="603" width="300" height="58" rx="10" fill="#17140f" stroke="#5b4b27"/>
+    <text x="414" y="638" fill="#cbbd91" font-size="17">Main model</text>
+    <text x="718" y="639" fill="#816b34" font-size="25">→</text>
+    <rect x="758" y="603" width="318" height="58" rx="10" fill="#17140f" stroke="#8d6c22"/>
+    <text x="782" y="638" fill="#e7cb73" font-size="17">Local · small model</text>
+  </g>
+</svg>
