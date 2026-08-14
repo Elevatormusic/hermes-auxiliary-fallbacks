@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import importlib.util
+import os
+import subprocess
 import sys
 import types
 import uuid
@@ -204,6 +206,248 @@ class PluginStateTests(TestCase):
             script._validate_config_path(home, case_home)
         with self.assertRaisesRegex(SystemExit, "unexpected configuration path"):
             script._validate_config_path(home, case_file)
+
+    def test_config_lock_rejects_redirect_before_open(self) -> None:
+        """Reject a profile redirect before the lock file can be created."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        redirected = False
+        script._is_reparse_point = lambda candidate: redirected and candidate == home
+        self.assertEqual(script._validate_config_path(home, config_path), config_path)
+        redirected = True
+
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            with script._config_file_lock(config_path):
+                self.fail("The redirected lock path was accepted.")
+
+        self.assertFalse(lock_path.exists())
+        redirected = False
+        external = self.fixture / "external-lock-sentinel.txt"
+        external.write_text("keep", encoding="utf-8")
+        real_open = Path.open
+
+        def open_then_redirect(current, *args, **kwargs):
+            nonlocal redirected
+            handle = real_open(current, *args, **kwargs)
+            if current == lock_path:
+                redirected = True
+            return handle
+
+        with mock.patch.object(Path, "open", open_then_redirect):
+            with self.assertRaisesRegex(SystemExit, "redirected path"):
+                with script._config_file_lock(config_path):
+                    self.fail("The redirected open lock was accepted.")
+
+        self.assertEqual(lock_path.stat().st_size, 0)
+        self.assertEqual(external.read_text(encoding="utf-8"), "keep")
+
+    def test_config_lock_rejects_redirect_after_acquisition(self) -> None:
+        """Reject a profile redirect after the lock is acquired."""
+
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        for scenario, error in (
+            ("redirect", "redirected path"),
+            ("source", "source directory"),
+            ("identity", "changed during acquisition"),
+        ):
+            with self.subTest(scenario=scenario):
+                script = load_script()
+                acquired = False
+                lock_calls: list[int] = []
+                fake_msvcrt = types.ModuleType("msvcrt")
+                fake_msvcrt.LK_NBLCK = 1
+                fake_msvcrt.LK_UNLCK = 2
+
+                def locking(_file_descriptor, mode, _length) -> None:
+                    nonlocal acquired
+                    lock_calls.append(mode)
+                    if mode == fake_msvcrt.LK_NBLCK:
+                        acquired = True
+
+                fake_msvcrt.locking = locking
+                real_os = script.os
+
+                class PathProxy:
+                    """Control the open-handle identity check."""
+
+                    def __getattr__(self, name: str):
+                        return getattr(real_os.path, name)
+
+                    @staticmethod
+                    def samestat(first, second) -> bool:
+                        if scenario == "identity" and acquired:
+                            return False
+                        return real_os.path.samestat(first, second)
+
+                class WindowsOsProxy:
+                    """Expose the Windows lock branch on each test platform."""
+
+                    name = "nt"
+                    path = PathProxy()
+
+                    def __getattr__(self, name: str):
+                        return getattr(real_os, name)
+
+                script.os = WindowsOsProxy()
+                script._is_reparse_point = lambda candidate: (
+                    scenario == "redirect" and acquired and candidate == home
+                )
+                if scenario == "source":
+                    script._find_hermes_source_root = lambda _path: (
+                        self.fixture if acquired else None
+                    )
+
+                with mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}):
+                    with self.assertRaisesRegex(SystemExit, error):
+                        with script._config_file_lock(config_path):
+                            self.fail("The changed lock path was accepted.")
+
+                self.assertEqual(
+                    lock_calls,
+                    [fake_msvcrt.LK_NBLCK, fake_msvcrt.LK_UNLCK],
+                )
+                self.assertTrue(lock_path.is_file())
+
+        script = load_script()
+        acquired = False
+        flock_calls: list[int] = []
+        fake_fcntl = types.ModuleType("fcntl")
+        fake_fcntl.LOCK_EX = 1
+        fake_fcntl.LOCK_NB = 2
+        fake_fcntl.LOCK_UN = 4
+
+        def flock(_file_descriptor, operation) -> None:
+            nonlocal acquired
+            flock_calls.append(operation)
+            if operation == fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB:
+                acquired = True
+
+        fake_fcntl.flock = flock
+        real_os = script.os
+
+        class PathProxy:
+            """Reject the POSIX identity after lock acquisition."""
+
+            def __getattr__(self, name: str):
+                return getattr(real_os.path, name)
+
+            @staticmethod
+            def samestat(first, second) -> bool:
+                if acquired:
+                    return False
+                return real_os.path.samestat(first, second)
+
+        class PosixOsProxy:
+            """Expose the POSIX lock branch on each test platform."""
+
+            name = "posix"
+            path = PathProxy()
+
+            def __getattr__(self, name: str):
+                return getattr(real_os, name)
+
+        script.os = PosixOsProxy()
+        with mock.patch.dict(sys.modules, {"fcntl": fake_fcntl}):
+            with self.assertRaisesRegex(SystemExit, "changed during acquisition"):
+                with script._config_file_lock(config_path):
+                    self.fail("The changed POSIX lock was accepted.")
+
+        self.assertEqual(
+            flock_calls,
+            [fake_fcntl.LOCK_EX | fake_fcntl.LOCK_NB, fake_fcntl.LOCK_UN],
+        )
+        self.assertTrue(lock_path.is_file())
+
+    def test_config_lock_rejects_inaccessible_source_marker(self) -> None:
+        """Reject a marker inspection error without writing the lock."""
+
+        script = load_script()
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        marker = home / "hermes_cli" / "config.py"
+        private_detail = "private-marker-detail"
+        real_stat = script.os.stat
+
+        def reject_marker(path, *args, **kwargs):
+            if Path(path) == marker:
+                raise PermissionError(private_detail)
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(script.os, "stat", side_effect=reject_marker):
+            with self.assertRaisesRegex(SystemExit, "cannot be inspected") as caught:
+                with script._config_file_lock(config_path):
+                    self.fail("The inaccessible source marker was accepted.")
+
+        self.assertNotIn(private_detail, str(caught.exception))
+        self.assertNotIn(str(marker), str(caught.exception))
+        self.assertFalse(lock_path.exists())
+
+    def test_config_lock_rejects_real_posix_lock_symlink(self) -> None:
+        """Reject a real POSIX symlink at the persistent lock path."""
+
+        if os.name != "posix":
+            self.skipTest("This host does not provide POSIX symlinks.")
+
+        script = load_script()
+        home = self.fixture / "home"
+        config_path = home / "config.yaml"
+        lock_path = home / ".config.yaml.auxiliary-fallbacks.lock"
+        external = self.fixture / "external-posix-lock.txt"
+        external.write_text("keep", encoding="utf-8")
+        try:
+            lock_path.symlink_to(external)
+        except OSError as exc:
+            self.skipTest(f"This host cannot create a test symlink: {exc.errno}")
+
+        with self.assertRaisesRegex(SystemExit, "redirected path"):
+            with script._config_file_lock(config_path):
+                self.fail("The POSIX lock symlink was accepted.")
+
+        self.assertEqual(external.read_text(encoding="utf-8"), "keep")
+
+    def test_config_lock_rejects_real_windows_junction(self) -> None:
+        """Reject a real Windows junction in the profile namespace."""
+
+        if os.name != "nt":
+            self.skipTest("This host does not provide Windows junctions.")
+
+        script = load_script()
+        target = self.fixture / "junction-target"
+        junction = self.fixture / "junction-home"
+        target.mkdir()
+        result = subprocess.run(
+            [
+                "cmd.exe",
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(junction),
+                str(target),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            self.skipTest("This host cannot create a test junction.")
+
+        try:
+            config_path = junction / "config.yaml"
+            target_lock = target / ".config.yaml.auxiliary-fallbacks.lock"
+            self.assertTrue(script._is_reparse_point(junction))
+            with self.assertRaisesRegex(SystemExit, "redirected path"):
+                with script._config_file_lock(config_path):
+                    self.fail("The Windows junction was accepted.")
+            self.assertFalse(target_lock.exists())
+        finally:
+            junction.rmdir()
 
     def test_receipt_path_rejects_outside_sibling_and_source_paths(self) -> None:
         """Reject receipt paths outside the safe profile home."""

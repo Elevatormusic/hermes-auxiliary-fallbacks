@@ -24,47 +24,63 @@ LOCK_TIMEOUT_SECONDS = 10.0
 def _config_file_lock(path: Path):
     """Hold a cross-process lock for this config transaction."""
 
-    lock_path = path.with_name(f".{path.name}.auxiliary-fallbacks.lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        import msvcrt
+    lock_path = _validate_config_lock_path(path)
+    try:
+        lock_path = _validate_config_lock_path(path)
+        handle = lock_path.open("a+b")
+    except OSError as exc:
+        raise SystemExit("The Hermes configuration lock is not available.") from exc
+    try:
+        _validate_open_config_lock(path, handle)
+        if os.name == "nt":
+            import msvcrt
 
-        if not lock_path.exists() or lock_path.stat().st_size == 0:
-            lock_path.write_text(" ", encoding="utf-8")
-        handle = lock_path.open("r+", encoding="utf-8")
-        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-        try:
-            while True:
-                try:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except (BlockingIOError, OSError, PermissionError) as exc:
-                    if time.monotonic() >= deadline:
-                        raise SystemExit(
-                            "Timed out while waiting for the Hermes configuration lock."
-                        ) from exc
-                    time.sleep(0.05)
             try:
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    _validate_open_config_lock(path, handle)
+                    handle.write(b" ")
+                    handle.flush()
+            except OSError as exc:
+                raise SystemExit(
+                    "The Hermes configuration lock is not available."
+                ) from exc
+            deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+            acquired = False
+            try:
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except (BlockingIOError, OSError, PermissionError) as exc:
+                        if time.monotonic() >= deadline:
+                            raise SystemExit(
+                                "Timed out while waiting for the Hermes configuration lock."
+                            ) from exc
+                        time.sleep(0.05)
+                _validate_open_config_lock(path, handle)
                 yield
             finally:
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        finally:
-            handle.close()
-        return
+                if acquired:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return
 
-    try:
-        import fcntl
-    except ImportError:
-        yield
-        return
+        try:
+            import fcntl
+        except ImportError as exc:
+            raise SystemExit(
+                "This platform does not provide a Hermes configuration lock."
+            ) from exc
 
-    with lock_path.open("a+", encoding="utf-8") as handle:
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        acquired = False
         while True:
             try:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
                 break
             except (BlockingIOError, OSError) as exc:
                 if time.monotonic() >= deadline:
@@ -73,9 +89,13 @@ def _config_file_lock(path: Path):
                     ) from exc
                 time.sleep(0.05)
         try:
+            _validate_open_config_lock(path, handle)
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -121,25 +141,91 @@ def _reject_reparse_ancestors(path: Path) -> None:
             raise SystemExit("The Hermes profile path uses a redirected path.")
 
 
+def _validate_config_lock_path(path: Path) -> Path:
+    """Return a lock path with safe existing ancestors."""
+
+    config_path = _absolute_lexical_path(path)
+    lock_path = config_path.with_name(
+        f".{config_path.name}.auxiliary-fallbacks.lock"
+    )
+    _reject_reparse_ancestors(config_path)
+    _reject_reparse_ancestors(lock_path)
+    if _find_hermes_source_root(lock_path.parent) is not None:
+        raise SystemExit(
+            "The Hermes configuration lock is inside a Hermes Agent source directory."
+        )
+    try:
+        directory_mode = os.stat(
+            lock_path.parent,
+            follow_symlinks=False,
+        ).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        raise SystemExit("The Hermes configuration lock is not available.") from None
+    except OSError as exc:
+        raise SystemExit("The Hermes configuration lock is not available.") from exc
+    if not stat.S_ISDIR(directory_mode):
+        raise SystemExit("The Hermes configuration lock is not available.")
+    return lock_path
+
+
+def _validate_open_config_lock(path: Path, handle: Any) -> Path:
+    """Match an open lock handle to its safe lexical path."""
+
+    lock_path = _validate_config_lock_path(path)
+    try:
+        open_stat = os.fstat(handle.fileno())
+        path_stat = os.stat(lock_path, follow_symlinks=False)
+        same_file = os.path.samestat(open_stat, path_stat)
+    except (OSError, NotImplementedError, ValueError) as exc:
+        raise SystemExit("The Hermes configuration lock cannot be verified.") from exc
+    if not same_file:
+        raise SystemExit("The Hermes configuration lock changed during acquisition.")
+    return lock_path
+
+
 def _find_hermes_source_root(path: Path) -> Path | None:
     """Find a Hermes Agent source root at or above a profile path."""
 
-    current = path if path.is_dir() else path.parent
+    current = path if _path_is_directory(path) else path.parent
     while True:
-        try:
-            is_source = (
-                (current / "hermes_cli" / "config.py").is_file()
-                and (current / "hermes_constants.py").is_file()
-                and (current / "pyproject.toml").is_file()
+        is_source = all(
+            _path_is_regular_file(marker)
+            for marker in (
+                current / "hermes_cli" / "config.py",
+                current / "hermes_constants.py",
+                current / "pyproject.toml",
             )
-        except OSError as exc:
-            raise SystemExit("The Hermes profile path cannot be inspected.") from exc
+        )
         if is_source:
             return current
         parent = current.parent
         if parent == current:
             return None
         current = parent
+
+
+def _path_is_directory(path: Path) -> bool:
+    """Return true only when an explicitly inspected path is a directory."""
+
+    try:
+        path_mode = os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise SystemExit("The Hermes profile path cannot be inspected.") from exc
+    return stat.S_ISDIR(path_mode)
+
+
+def _path_is_regular_file(path: Path) -> bool:
+    """Return true only when an explicitly inspected path is a regular file."""
+
+    try:
+        path_mode = os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise SystemExit("The Hermes profile path cannot be inspected.") from exc
+    return stat.S_ISREG(path_mode)
 
 
 def _validate_hermes_home(path: Path) -> Path:
